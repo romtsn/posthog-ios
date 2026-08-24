@@ -1,5 +1,17 @@
 ## Next
 
+## 3.69.8
+
+### Patch Changes
+
+- 35f27d3: Skip push token registration when the project has no push integration for the app_id, using the `push.appIds` list published in remote config. A device whose project configures push later re-registers on the next config load rather than staying unreachable.
+
+## 3.69.7
+
+### Patch Changes
+
+- 6f44883: Fix APNs registration callbacks being swallowed in SwiftUI apps that use `@UIApplicationDelegateAdaptor` (#768).
+
 ## 3.69.6
 
 ### Patch Changes

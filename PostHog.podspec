@@ -1,6 +1,6 @@
 Pod::Spec.new do |s|
   s.name             = "PostHog"
-  s.version          = "3.69.6"
+  s.version          = "3.69.8"
   s.summary          = "The hassle-free way to add posthog to your iOS app."
 
   s.description      = <<-DESC
@@ -48,6 +48,7 @@ Pod::Spec.new do |s|
   # Only PostHog's umbrella header should be public; vendored implementation headers stay private.
   s.public_header_files = 'PostHog/PostHog.h'
   s.private_header_files = [
+    'PostHog/ObjCExceptionSupport/PHObjCExceptionCatcher.h',
     'PostHog/ObjCExceptionSupport/PHURLSessionTaskSafeAccess.h',
     'vendor/libwebp/**/*.h',
     'vendor/PHPLCrashReporter/Source/**/*.{h,hpp}'

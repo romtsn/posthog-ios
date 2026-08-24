@@ -84,6 +84,7 @@ let maxRetryDelay = 30.0
     let onEventContextChanged = PostHogMulticastCallback<[String: Any]>()
     private var sessionIdChangedToken: RegistrationToken?
     private var didEnterBackgroundToken: RegistrationToken?
+    private var pushRemoteConfigToken: RegistrationToken?
 
     /// Logger facade exposing `trace/debug/info/warn/error/fatal(_:attributes:)`.
     /// `nil` before `setup(_:)` is called.
@@ -191,8 +192,24 @@ let maxRetryDelay = 30.0
                     self.map { $0.isEnabled() && !$0.isOptOutState() } ?? false
                 },
                 isEnabledProvider: { [weak self] in self?.isEnabled() ?? false },
+                pushAppIdsProvider: { [weak self] in self?.remoteConfig?.getPushAppIds() },
                 onEventContextChanged: onEventContextChanged
             )
+
+            // A device whose project had no push integration was answered 200 and stopped asking.
+            // Draining the transition here is the only signal that reaches it.
+            pushRemoteConfigToken = remoteConfig?.onRemoteConfigLoaded.subscribe { [weak self] _ in
+                guard let self, let newlyRegisterable = self.remoteConfig?.consumeNewlyRegisterablePushAppIds(),
+                      !newlyRegisterable.isEmpty
+                else {
+                    return
+                }
+                // Mark the one-time upgrade recovery done only after the handler has durably cleared
+                // any delivered marker, so a crash in between re-runs recovery instead of stranding.
+                self.pushSubscriptionHandler?.onPushAppIdsChanged(newlyRegisterable) { [weak self] in
+                    self?.remoteConfig?.markPushAppIdsMigrated()
+                }
+            }
 
             optOutLock.withLock {
                 let optOut = theStorage.getBool(forKey: .optOut)
@@ -1829,6 +1846,11 @@ let maxRetryDelay = 30.0
     /// let flagValue = PostHogSDK.shared.isFeatureEnabled("new_feature")
     /// ```
     ///
+    /// - Important: The reload is asynchronous and is **not** ordered against the automatic preload
+    ///   that `PostHogConfig.preloadFeatureFlags` starts at setup. See
+    ///   ``setPersonPropertiesForFlags(_:reloadFeatureFlags:)`` for the startup ordering contract and
+    ///   how to wait for flags evaluated with these properties.
+    ///
     /// - Parameter properties: Dictionary of person properties to include in flag evaluation
     /// - SeeAlso: `setPersonPropertiesForFlags(_:reloadFeatureFlags:)` to control flag reloading behavior
     @objc public func setPersonPropertiesForFlags(_ properties: [String: Any]) {
@@ -1854,6 +1876,34 @@ let maxRetryDelay = 30.0
     /// // Manually reload flags later
     /// PostHogSDK.shared.reloadFeatureFlags()
     /// ```
+    ///
+    /// ## Startup ordering
+    /// Several code paths can each start a `/flags` request at launch, and none of them is ordered
+    /// against this call:
+    /// - the automatic preload started during `setup()` when `PostHogConfig.preloadFeatureFlags` is
+    ///   `true` (the default) — it can go out before your properties are set, so an early flag read
+    ///   may see values evaluated without them,
+    /// - `identify(...)`, which reloads flags itself,
+    /// - any explicit `reloadFeatureFlags()` your app makes.
+    ///
+    /// Requests are coalesced rather than run concurrently, so your properties always reach the server
+    /// eventually. To read a flag that reflects them, set them without reloading and wait for an
+    /// explicit reload rather than reading immediately after setup:
+    ///
+    /// ```swift
+    /// PostHogSDK.shared.setPersonPropertiesForFlags(["plan": "premium"], reloadFeatureFlags: false)
+    /// PostHogSDK.shared.reloadFeatureFlags {
+    ///     let flagValue = PostHogSDK.shared.isFeatureEnabled("new_feature")
+    /// }
+    /// ```
+    ///
+    /// Setting `PostHogConfig.preloadFeatureFlags = false` removes the automatic preload entirely and
+    /// leaves your app in control of when flags load.
+    ///
+    /// - Note: `reset()` clears person properties set here, so they must be set again afterwards.
+    /// - Note: `reloadFeatureFlags(_:)` reports that the reload finished, not that it succeeded. If the
+    ///   request fails, or the project is over its feature flag quota, the handler still runs and the
+    ///   flags you read are the previously cached ones.
     ///
     /// - Parameters:
     ///   - properties: Dictionary of person properties to include in flag evaluation

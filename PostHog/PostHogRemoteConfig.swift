@@ -1,3 +1,4 @@
+// swiftlint:disable file_length
 //
 //  PostHogRemoteConfig.swift
 //  PostHog
@@ -29,6 +30,13 @@ class PostHogRemoteConfig {
     private var recordingMinimumDuration: TimeInterval?
 
     private let errorTrackingLock = NSLock()
+    private let pushLock = NSLock()
+    /// The app_ids this project accepts push registrations for, or nil when no server has told us.
+    /// Nil is not the empty list: it means attempt the registration, because a server older than
+    /// the key cannot be told apart from a project with push disabled.
+    private var pushAppIds: [String]?
+    /// app_ids that became registerable on the most recent /config read, drained by the handler.
+    private var newlyRegisterablePushAppIds: Set<String> = []
     private var autoCaptureExceptions = false
 
     private var flags: [String: Any]?
@@ -139,6 +147,7 @@ class PostHogRemoteConfig {
 
         preloadSessionReplay()
         preloadErrorTrackingConfig()
+        preloadPushConfig()
 
         // Remote config is always loaded (config.remoteConfig is now a no-op)
         preloadRemoteConfig()
@@ -237,6 +246,11 @@ class PostHogRemoteConfig {
                 // process error tracking config
                 self.processErrorTrackingConfig(config)
 
+                // process push config. Unlike the others this is not re-armed from cache on the
+                // /flags paths below: the in-memory list already holds the cached value, and a
+                // re-arm would compare the list against itself and find no transition.
+                self.processPushConfig(config)
+
                 // notify
                 DispatchQueue.main.async {
                     self.onRemoteConfigLoaded.invoke(config)
@@ -294,7 +308,7 @@ class PostHogRemoteConfig {
             anonymousId: anonymousId,
             deviceId: deviceId.isEmpty ? nil : deviceId,
             groups: groups,
-            callback: callback ?? { _ in },
+            callback: callback,
             surveyCompletion: surveyCompletion,
             coalesceWithCurrentRequest: surveyCompletion != nil && callback == nil
         )
@@ -378,11 +392,11 @@ class PostHogRemoteConfig {
         anonymousId: String?,
         deviceId: String? = nil,
         groups: [String: String],
-        callback: @escaping ([String: Any]?) -> Void,
+        callback: (([String: Any]?) -> Void)? = nil,
         surveyCompletion: (([String: Any]?) -> Void)? = nil,
         coalesceWithCurrentRequest: Bool = false
     ) {
-        let (alreadyLoading, previousCallback): (Bool, (([String: Any]?) -> Void)?) = loadingFeatureFlagsLock.withLock {
+        let shouldStart: Bool = loadingFeatureFlagsLock.withLock {
             let requestContext: [String: Any] = [
                 "distinctId": distinctId,
                 "anonymousId": anonymousId ?? NSNull(),
@@ -400,27 +414,24 @@ class PostHogRemoteConfig {
                        NSDictionary(dictionary: $0).isEqual(to: requestContext)
                    }) == true
                 {
-                    return (true, nil)
+                    // Satisfied by the request already in flight; resolved via surveyFeatureFlagsWaiters.
+                    return false
                 }
-                let prev = self.pendingFeatureFlagsRequest?.callback
+                let callbacks = (self.pendingFeatureFlagsRequest?.callbacks ?? []) + [callback].compactMap { $0 }
                 self.pendingFeatureFlagsRequest = PendingFeatureFlagsRequest(
                     distinctId: distinctId,
                     anonymousId: anonymousId,
                     deviceId: deviceId,
                     groups: groups,
-                    callback: callback
+                    callbacks: callbacks
                 )
-                return (true, prev)
+                return false
             }
             self.loadingFeatureFlags = true
             self.activeFeatureFlagsRequestContext = requestContext
-            return (false, nil)
+            return true
         }
-        if alreadyLoading {
-            let cached = featureFlagsLock.withLock { getCachedFeatureFlags() }
-            previousCallback?(cached)
-            return
-        }
+        guard shouldStart else { return }
 
         let personProperties = getPersonPropertiesForFlags()
         let groupProperties = getGroupPropertiesForFlags()
@@ -451,14 +462,16 @@ class PostHogRemoteConfig {
                     self.processErrorTrackingConfig(nil)
 
                     self.notifyFeatureFlagsAndRelease(cachedFeatureFlags)
-                    return callback(cachedFeatureFlags)
+                    callback?(cachedFeatureFlags)
+                    return
                 }
 
                 // Safely handle optional data
                 guard var data = data else {
                     hedgeLog("Error: Flags response data is nil")
                     self.notifyFeatureFlagsAndRelease(nil)
-                    return callback(nil)
+                    callback?(nil)
+                    return
                 }
 
                 self.normalizeResponse(&data)
@@ -470,7 +483,8 @@ class PostHogRemoteConfig {
                 else {
                     hedgeLog("Error: Flags response missing correct featureFlags format")
                     self.notifyFeatureFlagsAndRelease(nil)
-                    return callback(nil)
+                    callback?(nil)
+                    return
                 }
 
                 // /flags carries no config; re-arm from the cached remote config
@@ -532,7 +546,7 @@ class PostHogRemoteConfig {
                 }
 
                 self.notifyFeatureFlagsAndRelease(loadedFeatureFlags)
-                return callback(loadedFeatureFlags)
+                callback?(loadedFeatureFlags)
             }
         }
     }
@@ -652,6 +666,71 @@ class PostHogRemoteConfig {
         }
     }
 
+    /// Parses the `push` slice and records the app_ids that became registerable since the last read,
+    /// so the push handler can re-register a device that was stuck.
+    ///
+    /// A missing key clears the list rather than keeping it: a server that stops sending the key is
+    /// treated as one that never sent it, which means attempt the registration and never silently
+    /// withholds a device from a project that has push.
+    private func processPushConfig(_ data: [String: Any]?) {
+        let appIds = (data?["push"] as? [String: Any])?["appIds"] as? [String]
+
+        pushLock.withLock {
+            // Absent for the comparison means the empty set, not unknown. The first launch that ever
+            // sees the key therefore treats every configured app_id as new, which re-registers a
+            // device that recorded a success while its project had no integration. That costs one
+            // request per device, once, and it is the only way to reach a device whose project was
+            // configured before it updated to a version that reads this key.
+            let previous = Set(pushAppIds ?? [])
+            pushAppIds = appIds
+            let live = Set(appIds ?? [])
+            var newly = live.subtracting(previous)
+            // Upgrade recovery: an older SDK cached the whole remote-config blob including push.appIds,
+            // so preloadPushConfig seeds pushAppIds and the live response shows no transition. A device
+            // stranded by that older SDK would keep its delivered marker forever. The first load after
+            // this gate ships treats every currently-registerable app_id as newly registerable so the
+            // recovery runs once. The migrated flag is persisted only after the marker clear is durable
+            // (see markPushAppIdsMigrated), so a crash in that window re-runs recovery rather than
+            // stranding the device.
+            if storage.getBool(forKey: .pushAppIdsMigrated) != true {
+                newly.formUnion(live)
+            }
+            newlyRegisterablePushAppIds = newly
+        }
+    }
+
+    /// Records that the one-time upgrade recovery has run. Called by the push handler once it has
+    /// durably cleared any delivered marker, so the flag never advances ahead of the recovery.
+    func markPushAppIdsMigrated() {
+        storage.setBool(forKey: .pushAppIdsMigrated, contents: true)
+    }
+
+    private func preloadPushConfig() {
+        let push = remoteConfigLock.withLock {
+            getCachedRemoteConfig()?["push"] as? [String: Any]
+        }
+        if let appIds = push?["appIds"] as? [String] {
+            pushLock.withLock {
+                pushAppIds = appIds
+            }
+        }
+    }
+
+    /// The app_ids this project accepts push registrations for, or nil when no server has told us.
+    func getPushAppIds() -> [String]? {
+        pushLock.withLock { pushAppIds }
+    }
+
+    /// app_ids that became registerable on the most recent /config read, cleared by reading them.
+    /// Draining rather than peeking keeps a device from re-registering on every subsequent load.
+    func consumeNewlyRegisterablePushAppIds() -> Set<String> {
+        pushLock.withLock { () -> Set<String> in
+            let newlyRegisterable = newlyRegisterablePushAppIds
+            newlyRegisterablePushAppIds = []
+            return newlyRegisterable
+        }
+    }
+
     /// Returns whether autocapture of exceptions is enabled based on the remote config.
     /// The remote config must have `autocaptureExceptions` set to `true` or a dictionary.
     func isAutocaptureExceptionsEnabled() -> Bool {
@@ -683,7 +762,7 @@ class PostHogRemoteConfig {
                 anonymousId: pending.anonymousId,
                 deviceId: pending.deviceId,
                 groups: pending.groups,
-                callback: pending.callback
+                callback: { flags in pending.callbacks.forEach { $0(flags) } }
             )
         } else {
             for waiter in surveyWaiters {
@@ -880,18 +959,12 @@ class PostHogRemoteConfig {
     }
 
     func getPersonPropertiesForFlags() -> [String: Any] {
-        personPropertiesForFlagsLock.withLock {
-            var properties = personPropertiesForFlags
-
-            // Always include fresh default properties if enabled
-            if config.setDefaultPersonProperties {
-                let defaultProperties = getDefaultPersonProperties()
-                // User-set properties override default properties
-                properties = defaultProperties.merging(properties) { _, userValue in userValue }
-            }
-
-            return properties
-        }
+        let properties = personPropertiesForFlagsLock.withLock { personPropertiesForFlags }
+        // `getDefaultPersonProperties()` reaches `setupLock` via `isEnabled()`, so it must not run
+        // while `personPropertiesForFlagsLock` is held.
+        guard config.setDefaultPersonProperties else { return properties }
+        // User-set properties override default properties
+        return getDefaultPersonProperties().merging(properties) { _, userValue in userValue }
     }
 
     private func loadCachedPropertiesForFlags() {
@@ -1175,7 +1248,7 @@ private struct PendingFeatureFlagsRequest {
     let anonymousId: String?
     let deviceId: String?
     let groups: [String: String]
-    let callback: ([String: Any]?) -> Void
+    let callbacks: [([String: Any]?) -> Void]
 }
 
 #if TESTING
