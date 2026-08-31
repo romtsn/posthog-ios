@@ -1,5 +1,43 @@
 ## Next
 
+## 3.70.1
+
+### Patch Changes
+
+- ac3dc31: Fix session replay masks drifting away from the content they cover while a screen scrolls or animates. During fast scrolling, frames are captured with a renderer that keeps masks aligned but draws blur, video and Metal content flat, and that also ignores `layer.mask`, `maskView` and CoreAnimation `filters` — content hidden by those alone is drawn in full in those frames. Use `postHogMask()` for anything that must never appear in a recording.
+
+## 3.70.0
+
+### Minor Changes
+
+- b67d001: Surveys can now display an optional intro screen before the first question, configured via the new `displayIntroScreen`, `introScreenHeader`, `introScreenDescription`, `introScreenDescriptionContentType`, and `introScreenButtonText` appearance fields (mirroring the existing thank-you message fields, including translations). Advancing past the intro records no response and sends no survey event; dismissing the survey from the intro still sends the normal `survey dismissed` event. The new fields are also exposed on `PostHogDisplaySurveyAppearance` for custom survey delegates. Additionally fixes the thank-you message description never rendering in the built-in survey UI.
+
+## 3.69.12
+
+### Patch Changes
+
+- 2c034db: Use posthog-cli 0.15.1 and newer to read release metadata directly from the app Info.plist when uploading debug symbols.
+
+## 3.69.11
+
+### Patch Changes
+
+- a8175f1: Fix a fatal SIGPIPE when session replay console log capture is torn down, for example when the app backgrounds with `sessionReplayConfig.captureLogs` enabled. Teardown closed the descriptors the pipe readers were still writing to, which could kill the process.
+
+## 3.69.10
+
+### Patch Changes
+
+- b2d09aa: Upload symbols under the app version reported by Info.plist, including custom build settings. Wait for the current dSYM and fail after a configurable timeout instead of uploading invalid symbols.
+
+## 3.69.9
+
+### Patch Changes
+
+- 275505d: Mask React Native New Architecture (Fabric) text and image component views (RCTParagraphComponentView, RCTImageComponentView) and react-native-svg root views (RNSVGSvgView) during session replay, matching the existing legacy RCTTextView/RCTImageView handling.
+- 7285d17: Fix `reloadFeatureFlags(_:)` completion handlers resolving with stale cached flags when a reload was displaced from the pending queue. They now resolve against a `/flags` response that actually went out, so they fire later — after a round trip and any retries — but with flags evaluated for the caller's request-time person properties.
+- 856667f: Drop events and logs when Objective-C beforeSend callbacks raise exceptions.
+
 ## 3.69.8
 
 ### Patch Changes
