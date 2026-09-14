@@ -275,6 +275,16 @@ let maxRetryDelay = 30.0
                 notifyExceptionStepsDidChange()
             }
 
+            #if os(iOS) || os(macOS)
+                // Releases a prewarm this setup turns out not to want — including while opted out,
+                // where the integrations above were never installed and so could never release it.
+                if #available(iOS 14.0, macOS 11.0, *) {
+                    if !config.installsPushNotificationOpenIntegration {
+                        DI.main.pushNotificationPublisher.discardPrewarmedNotificationResponseCapture()
+                    }
+                }
+            #endif
+
             // Next-launch retry for a persisted, not-yet-delivered push subscription
             // (no-ops while opted out, offline, or when the record was already delivered).
             pushSubscriptionHandler?.retryIfNeeded()
@@ -2668,11 +2678,17 @@ let maxRetryDelay = 30.0
         /// Captures the current native window for a first-party wrapper SDK
         /// (e.g. posthog-flutter) that drives session-replay capture on its own
         /// cadence. Not for app use — it shares snapshot state with the normal
-        /// timer-driven capture. Returns false if no frame was captured, so the
-        /// caller can retry.
+        /// timer-driven capture. Returns true when an image is captured and enqueued
+        /// for asynchronous masking; returns false when capture cannot be enqueued.
+        ///
+        /// Flutter treats true as a started bridge episode. A rare allocation failure
+        /// during later masking can still drop that frame after Flutter sees success.
+        /// The frame is dropped safely, never sent unmasked. Keep masking off main and
+        /// this synchronous contract for now; revisit final-result reporting if the
+        /// missed opening frame becomes a practical problem.
         ///
         /// Pass [episodeFirstFrame] until the episode's first frame has been
-        /// *captured* (returned true) — not just on the first attempt: it
+        /// enqueued (returned true) — not just on the first attempt: it
         /// renders with `afterScreenUpdates` so a freshly-presented screen
         /// isn't captured black, and re-arms the per-window meta and dedup
         /// hash, so a retried opening frame keeps its reset. Drop it for
@@ -3139,6 +3155,27 @@ let maxRetryDelay = 30.0
     #endif
 
     #if os(iOS) || os(macOS)
+        /// Installs the notification-open swizzles before `setup()` is called.
+        ///
+        /// A cold launch from a notification tap delivers the response to the app within a few hundred
+        /// milliseconds — sooner than a cross-platform host (Flutter, React Native) can reach its own
+        /// `setup()` call from the Dart/JS runtime, so the swizzles are not yet in place and the open is
+        /// lost. Call this from `application(_:didFinishLaunchingWithOptions:)`, or from a plugin
+        /// registration that runs inside it, and the response is held until `setup()` installs the
+        /// integration, which then captures it.
+        ///
+        /// Holds at most one response, and only replays it when `setup()` follows within 30 seconds.
+        /// Native iOS apps that call `setup()` from `didFinishLaunchingWithOptions` do not need this.
+        ///
+        /// The swizzles are installed immediately and released again when the last subscriber detaches
+        /// (`close()`), or at `setup()` when the config disables push-open capture or the app is
+        /// opted out. If `setup()` is never called they stay for the process lifetime. The per-class
+        /// delegate wrapper, as elsewhere in this SDK, stays for the process lifetime regardless.
+        @available(iOS 14.0, macOS 11.0, *)
+        @objc public static func prewarmPushNotificationOpenCapture() {
+            DI.main.pushNotificationPublisher.prewarmNotificationResponseCapture()
+        }
+
         /// Manually captures a `$push_notification_opened` event for a notification the user tapped.
         ///
         /// Use this when you're not relying on the automatic swizzling installed by

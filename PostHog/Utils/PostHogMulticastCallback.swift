@@ -102,6 +102,13 @@ final class PostHogThrottledMulticastCallback<T> {
     private let lock = NSLock()
     private let onSubscriberCountChanged: ((Int) -> Void)?
 
+    // Heuristic budget: keep small bursts synchronous, but yield under sustained churn instead
+    // of letting an unbounded drain monopolize the caller. This is not a measured threshold.
+    private let subscriberCountBatchLimit = 32
+    private var isNotifyingSubscriberCount = false
+    private var needsSubscriberCountNotification = false
+    private let subscriberCountQueue = DispatchQueue(label: "com.posthog.SubscriberCount")
+
     /// Serial queue that drains throttled callbacks. Stored per instance: generic types
     /// cannot have stored static properties, and a computed static would allocate a fresh
     /// queue on every `invoke()` — besides the allocation cost, separate queues would also
@@ -111,7 +118,7 @@ final class PostHogThrottledMulticastCallback<T> {
         target: .global(qos: .utility)
     )
 
-    /// Earliest instant at which any subscriber becomes eligible to fire again. Guarded by
+    /// Earliest instant at which any leading-only subscriber becomes eligible to fire again. Guarded by
     /// `lock`. May be stale-early (worst case: one extra no-op dispatch), but never
     /// stale-late: `subscribe` resets it, and only the drain on `throttleQueue` moves it
     /// forward from the live subscriber map.
@@ -119,6 +126,8 @@ final class PostHogThrottledMulticastCallback<T> {
 
     /// Creates a new throttled multicast callback.
     /// - Parameter onSubscriberCountChanged: Optional closure called when subscriber count changes.
+    ///   Concurrent and reentrant changes are coalesced, and count callbacks never overlap.
+    ///   After a bounded synchronous batch, pending changes are reconciled asynchronously in bounded batches.
     init(onSubscriberCountChanged: ((Int) -> Void)? = nil) {
         self.onSubscriberCountChanged = onSubscriberCountChanged
     }
@@ -126,50 +135,95 @@ final class PostHogThrottledMulticastCallback<T> {
     /// Subscribe to this callback with a throttle interval.
     /// - Parameters:
     ///   - throttle: The minimum interval between callback invocations for this subscriber.
+    ///   - trailing: Deliver the latest value received inside a window when that window closes.
+    ///     Values are coalesced while delivery is waiting for the main thread.
     ///   - callback: The callback to invoke when `invoke()` is called (on main thread).
     /// - Returns: A `RegistrationToken` that unsubscribes when deallocated.
-    func subscribe(throttle interval: TimeInterval, _ callback: @escaping (T) -> Void) -> RegistrationToken {
+    func subscribe(throttle interval: TimeInterval, trailing: Bool = false, _ callback: @escaping (T) -> Void) -> RegistrationToken {
         let id = UUID()
-        let newCount = lock.withLock {
-            callbacks[id] = ThrottledCallback(handler: callback, interval: interval)
+        lock.withLock {
+            callbacks[id] = ThrottledCallback(handler: callback, interval: interval, trailing: trailing)
             // A new subscriber is immediately eligible; without this reset the invoke()
             // gate could suppress its first fire until the other subscribers' windows open.
             nextEligibleFire = .distantPast
-            return callbacks.count
         }
-        onSubscriberCountChanged?(newCount)
+        notifySubscriberCountChanged()
         return RegistrationToken { [weak self] in
             guard let self else { return }
-            let newCount = self.lock.withLock {
+            self.lock.withLock {
                 self.callbacks[id] = nil
-                return self.callbacks.count
             }
-            self.onSubscriberCountChanged?(newCount)
+            self.notifySubscriberCountChanged()
+        }
+    }
+
+    private func notifySubscriberCountChanged() {
+        guard onSubscriberCountChanged != nil else { return }
+        let shouldNotify = lock.withLock { () -> Bool in
+            needsSubscriberCountNotification = true
+            guard !isNotifyingSubscriberCount else { return false }
+            isNotifyingSubscriberCount = true
+            return true
+        }
+        guard shouldNotify else { return }
+        drainSubscriberCountNotifications()
+    }
+
+    private func drainSubscriberCountNotifications() {
+        guard let onSubscriberCountChanged else { return }
+        for _ in 0 ..< subscriberCountBatchLimit {
+            let count = lock.withLock { () -> Int? in
+                guard needsSubscriberCountNotification else {
+                    isNotifyingSubscriberCount = false
+                    return nil
+                }
+                needsSubscriberCountNotification = false
+                return callbacks.count
+            }
+            guard let count else { return }
+            // Observers may subscribe or unsubscribe. Reconcile those changes after they return,
+            // without holding the state lock or delivering a captured, out-of-order count.
+            onSubscriberCountChanged(count)
+        }
+
+        let shouldContinue = lock.withLock { () -> Bool in
+            guard needsSubscriberCountNotification else {
+                isNotifyingSubscriberCount = false
+                return false
+            }
+            return true
+        }
+        guard shouldContinue else { return }
+        // Retain notification ownership across the queue hop so mutators only mark pending work.
+        subscriberCountQueue.async { [weak self] in
+            self?.drainSubscriberCountNotifications()
         }
     }
 
     /// Invoke all subscribed callbacks, respecting each subscriber's throttle interval.
     /// - Parameter value: The value to pass to all callbacks.
     func invoke(_ value: T) {
-        // Synchronous cheap gate: skip the dispatch (queue hop + closure allocation)
-        // entirely when nobody is subscribed or no subscriber's throttle window has
-        // elapsed yet. This is the steady state when invoked per view layout.
         let shouldDispatch = lock.withLock {
-            !callbacks.isEmpty && now() >= nextEligibleFire
+            // Record trailing values before the eligibility gate. Updating an already pending
+            // value does not allocate another work item or dispatch for every view layout.
+            for callback in callbacks.values where callback.trailing {
+                callback.invokeTrailing(value)
+            }
+            return callbacks.values.contains { !$0.trailing } && now() >= nextEligibleFire
         }
         guard shouldDispatch else { return }
 
         throttleQueue.async { [weak self] in
             guard let self else { return }
-            let callbacks = self.lock.withLock { Array(self.callbacks.values) }
+            let callbacks = self.lock.withLock { self.callbacks.values.filter { !$0.trailing } }
             for callback in callbacks {
                 callback.invokeIfReady(value)
             }
             // Recompute from the live subscriber map (not the drained copy) so a
             // subscriber added mid-drain — eligible immediately — is not gated out.
-            // `lastFired` is only mutated on this serial queue, so reading it here is safe.
+            // Leading-only subscribers' `lastFired` is only mutated on this serial queue.
             self.lock.withLock {
-                self.nextEligibleFire = self.callbacks.values.map(\.nextEligibleTime).min() ?? .distantFuture
+                self.nextEligibleFire = self.callbacks.values.filter { !$0.trailing }.map(\.nextEligibleTime).min() ?? .distantFuture
             }
         }
     }
@@ -182,16 +236,65 @@ final class PostHogThrottledMulticastCallback<T> {
     private final class ThrottledCallback {
         let interval: TimeInterval
         let handler: (T) -> Void
+        let trailing: Bool
         private var lastFired: Date = .distantPast
 
-        /// Read only on the owning callback's `throttleQueue` (same place `lastFired` mutates).
+        // Trailing subscriptions accept values synchronously, rather than queueing every layout.
+        // Their state is shared with the delayed main-queue delivery and guarded by this lock.
+        private let trailingLock = NSLock()
+        private var pendingValue: T?
+        private var pendingWork: DispatchWorkItem?
+
+        /// Used only for leading-only subscriptions on the owning callback's `throttleQueue`.
         var nextEligibleTime: Date {
             lastFired.addingTimeInterval(interval)
         }
 
-        init(handler: @escaping (T) -> Void, interval: TimeInterval) {
+        init(handler: @escaping (T) -> Void, interval: TimeInterval, trailing: Bool) {
             self.handler = handler
             self.interval = interval
+            self.trailing = trailing
+        }
+
+        deinit {
+            // Scheduled work only weakly references this subscription, so dropping its token
+            // (including replay stop/reset) releases the handler and cancels pending delivery.
+            pendingWork?.cancel()
+        }
+
+        func invokeTrailing(_ value: T) {
+            guard interval > 0 else {
+                DispatchQueue.main.async { [weak self] in
+                    self?.handler(value)
+                }
+                return
+            }
+            trailingLock.withLock {
+                // .some preserves a pending nil when T itself is Optional.
+                pendingValue = .some(value)
+                guard pendingWork == nil else { return }
+                let remaining = max(0, interval - now().timeIntervalSince(lastFired))
+                let work = DispatchWorkItem { [weak self] in
+                    self?.fireTrailing()
+                }
+                pendingWork = work
+                DispatchQueue.main.asyncAfter(deadline: .now() + remaining, execute: work)
+            }
+        }
+
+        private func fireTrailing() {
+            let value: T? = trailingLock.withLock {
+                let value = pendingValue
+                pendingValue = nil
+                pendingWork = nil
+                // Start the next window at delivery, not scheduling: a busy main thread must
+                // not accumulate snapshots that then fire back-to-back when it becomes free.
+                lastFired = now()
+                return value
+            }
+            if let value {
+                handler(value)
+            }
         }
 
         func invokeIfReady(_ value: T) {

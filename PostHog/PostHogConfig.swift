@@ -89,10 +89,13 @@ public typealias BeforeSendBlock = (PostHogEvent) -> PostHogEvent?
     /// Default: `30`.
     @objc public var flushIntervalSeconds: TimeInterval = Defaults.flushIntervalSeconds
 
-    /// Maximum number of consecutive flush attempts before the entire queue is
-    /// dropped to avoid infinite retries against a permanently-broken backend.
-    /// Increments on every retriable failure including HTTP 413 cap halving;
-    /// resets on a successful 2xx response. Default 3.
+    /// Maximum number of retries for push-subscription registration failures.
+    ///
+    /// This limit does not apply to event, replay, or log ingestion. Retryable ingestion
+    /// failures retain queued records for later flush triggers, subject to backoff.
+    /// Use `maxQueueSize` for events and replay, and `logs.maxBufferSize` for logs.
+    ///
+    /// Default: `3`.
     @objc public var maxRetries: Int = Defaults.maxRetries
 
     /// Maximum number of retries for feature flag requests after transient network errors or retryable HTTP responses.
@@ -189,6 +192,9 @@ public typealias BeforeSendBlock = (PostHogEvent) -> PostHogEvent?
         ///   `userNotificationCenter(_:didReceive:withCompletionHandler:)` implementation.
         ///
         /// Default: true. Set to `false` to opt out.
+        ///
+        /// Requires your app to set `UNUserNotificationCenter.current().delegate`. Without one, iOS
+        /// reports the tap to nobody and no open can be captured, in any app state.
         @objc public var capturePushNotificationOpened: Bool = true
     #endif
 
@@ -559,7 +565,7 @@ public typealias BeforeSendBlock = (PostHogEvent) -> PostHogEvent?
                         integrations.append(PostHogPushNotificationSubscriptionIntegration())
                     }
                 #endif
-                if capturePushNotificationOpened {
+                if installsPushNotificationOpenIntegration {
                     integrations.append(PostHogPushNotificationOpenIntegration())
                 }
             }
@@ -567,6 +573,15 @@ public typealias BeforeSendBlock = (PostHogEvent) -> PostHogEvent?
 
         return integrations
     }
+
+    #if os(iOS) || os(macOS)
+        /// `setup()`'s prewarm-discard gate is the negation of this, and the discard is the only thing
+        /// that releases a prewarm the config did not want. Both read this property so a new reason
+        /// not to install cannot be added on one side only.
+        var installsPushNotificationOpenIntegration: Bool {
+            capturePushNotificationOpened && enableSwizzling && !optOut
+        }
+    #endif
 
     var _surveys: Bool = true // swiftlint:disable:this identifier_name
     private func setSurveys(_ value: Bool) {
