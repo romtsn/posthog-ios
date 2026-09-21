@@ -185,7 +185,16 @@ public typealias BeforeSendBlock = (PostHogEvent) -> PostHogEvent?
 
         /// Automatically capture a `$push_notification_opened` event when the user taps a **remote** push
         /// notification, by swizzling `UNUserNotificationCenterDelegate`. Locally-scheduled notifications
-        /// are ignored — call `capturePushNotificationOpened(response:)` yourself to capture those.
+        /// are ignored — capture those yourself with
+        /// `PostHogSDK.capturePushNotificationOpened(title:subtitle:body:payload:action:)`, passing the
+        /// content you scheduled. `capturePushNotificationOpened(response:)` reads title/subtitle/body
+        /// only from notifications PostHog sent (a `posthog` key in `userInfo`), so for a local one it
+        /// captures the open with no content.
+        ///
+        /// A notification sent by PostHog is captured once: a manual `capturePushNotificationOpened`
+        /// call for a tap this already captured (same `posthog.invocation_id` and `action_id`, within
+        /// 5 minutes) is skipped, and so is the reverse. A resend of that notification is a separate
+        /// tap and is captured.
         ///
         /// - Note: Requires `enableSwizzling` to be `true`. To capture opens without swizzling, call
         ///   `PostHogSDK.capturePushNotificationOpened(response:)` from your own
@@ -239,8 +248,36 @@ public typealias BeforeSendBlock = (PostHogEvent) -> PostHogEvent?
     ///
     /// While opted out, capture calls are ignored and integrations are not installed.
     /// Use `PostHogSDK.optIn()` and `PostHogSDK.optOut()` to change the persisted state at runtime.
+    /// A state persisted by an earlier launch wins over this value, unless `reset()` cleared it or
+    /// opt-out persistence is turned off.
     /// Default: `false`.
     @objc public var optOut: Bool = false
+
+    /// Whether the SDK stores the opt-out state itself and restores it at setup.
+    ///
+    /// Default: `true` — `PostHogSDK.optIn()` and `PostHogSDK.optOut()` write the state to disk, and
+    /// setup reads it back, where it takes precedence over ``optOut``. A runtime choice made by the
+    /// user therefore outlives the app's configured default.
+    ///
+    /// Set to `false` only when the layer above the SDK keeps its own consent store; leave it `true`
+    /// otherwise. The SDK then never reads its own copy and `optIn()`/`optOut()` never write it,
+    /// though `reset()` still clears the key. ``optOut`` is the truth at setup, and `optIn()`/`optOut()`
+    /// change only the running SDK.
+    ///
+    /// ```swift
+    /// @_spi(PostHogInternal) import PostHog
+    ///
+    /// let config = PostHogConfig(projectToken: "<ph_project_token>")
+    /// config.persistOptOut = false
+    /// config.optOut = hostConsentStore.isOptedOut
+    /// PostHogSDK.shared.setup(config)
+    /// ```
+    ///
+    /// Set it before `setup()`. Changing it afterwards does not re-resolve the value setup already
+    /// read, but does change whether `optIn()`/`optOut()` write to disk.
+    ///
+    /// SPI, not public API: no stability guarantees.
+    @_spi(PostHogInternal) public var persistOptOut: Bool = true
 
     /// Hook used to customize newly generated anonymous IDs.
     ///
@@ -527,9 +564,7 @@ public typealias BeforeSendBlock = (PostHogEvent) -> PostHogEvent?
             integrations.append(PostHogScreenViewIntegration())
         }
 
-        if captureApplicationLifecycleEvents {
-            integrations.append(PostHogAppLifeCycleIntegration())
-        }
+        integrations.append(PostHogAppLifeCycleIntegration())
 
         #if os(iOS)
             if tracingHeaders?.isEmpty == false {

@@ -5,7 +5,7 @@
 //  Created by Yiannis Josephides on 19/02/2025.
 //
 
-@testable import PostHog
+@_spi(PostHogInternal) @testable import PostHog
 import Testing
 import XCTest
 
@@ -114,16 +114,44 @@ class PostHogIntegrationInstallationTest {
         }
     #endif
 
-    @Test("app life cycle integration installed only once, on first instance")
-    func appLifeCycleIntegrationInstalledOnce() async {
-        let first = getSut(projectToken: "test_project_token", captureApplicationLifecycleEvents: true)
+    @Test("app life cycle event capture belongs to the first enabled instance", arguments: [false, true])
+    func appLifeCycleIntegrationInstalledOnce(captureLifecycle: Bool) async {
+        let first = getSut(projectToken: "test_project_token", captureApplicationLifecycleEvents: captureLifecycle)
         let second = getSut(projectToken: "test_project_token", captureApplicationLifecycleEvents: true)
 
         #expect(first.getAppLifeCycleIntegration() != nil)
-        #expect(second.getAppLifeCycleIntegration() == nil)
+        if captureLifecycle {
+            #expect(second.getAppLifeCycleIntegration() == nil)
+        } else {
+            #expect(second.getAppLifeCycleIntegration() != nil)
+        }
 
         first.close()
         second.close()
+    }
+
+    @Test("lifecycle ownership is released when the SDK is released", arguments: [false, true])
+    func lifecycleOwnershipReleasedWithSDK(explicitClose: Bool) throws {
+        var first: PostHogSDK? = getSut(
+            projectToken: "test_project_token",
+            captureApplicationLifecycleEvents: true,
+            enableSwizzling: false
+        )
+        weak var released = first
+        #expect(first?.getAppLifeCycleIntegration() != nil)
+        if explicitClose {
+            first?.close()
+        }
+        first = nil
+        try #require(released == nil)
+
+        let replacement = getSut(
+            projectToken: "test_project_token",
+            captureApplicationLifecycleEvents: true,
+            enableSwizzling: false
+        )
+        defer { replacement.close() }
+        #expect(replacement.getAppLifeCycleIntegration() != nil)
     }
 
     @Test("screen view integration installed only once, on first instance")
@@ -136,6 +164,28 @@ class PostHogIntegrationInstallationTest {
 
         first.close()
         second.close()
+    }
+
+    @Test("a stored opt-in does not install the screen-view integration when the host owns consent")
+    func noIntegrationsWhenHostOwnsConsent() async {
+        let token = "test_host_consent_\(UUID().uuidString)"
+        let config = PostHogConfig(projectToken: token, host: "http://localhost:9001")
+        config.disableRemoteConfigForTesting = true
+        config.disableFlushOnBackgroundForTesting = true
+        config.disableReachabilityForTesting = true
+        config.captureScreenViews = true
+        config.persistOptOut = false
+        config.optOut = true
+
+        let storage = PostHogStorage(config)
+        defer { storage.reset() }
+        storage.setBool(forKey: .optOut, contents: false)
+
+        let sut = PostHogSDK.with(config)
+        defer { sut.close() }
+
+        #expect(sut.getScreenViewIntegration() == nil)
+        #expect(sut.getAppLifeCycleIntegration() == nil)
     }
 
     // MARK: - Error tracking integration

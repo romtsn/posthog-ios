@@ -26,6 +26,7 @@
 
         var body: some View {
             surveyContent(for: survey)
+                .id(displayManager.currentQuestionIndex)
                 .animation(.linear(duration: 0.25), value: displayManager.currentQuestionIndex)
                 .readFrame(in: .named("survey-scroll-view")) { frame in
                     sheetHeight = frame.height
@@ -59,6 +60,7 @@
                     RatingQuestionView(question: currentQuestion) { resp in
                         displayManager.onNextQuestion(index: displayManager.currentQuestionIndex, response: .rating(resp))
                     }
+                    .id(currentQuestion.id)
                 case let currentQuestion as PostHogDisplayChoiceQuestion:
                     if currentQuestion.isMultipleChoice {
                         MultipleChoiceQuestionView(question: currentQuestion) { resp in
@@ -68,6 +70,7 @@
                         SingleChoiceQuestionView(question: currentQuestion) { resp in
                             displayManager.onNextQuestion(index: displayManager.currentQuestionIndex, response: .singleChoice(resp))
                         }
+                        .id(currentQuestion.id)
                     }
                 default:
                     EmptyView()

@@ -1,5 +1,77 @@
 ## Next
 
+## 3.79.1
+
+### Patch Changes
+
+- 7c43ee4: Remember the app version and build when lifecycle capture is disabled, so enabling it on a later launch does not report a false Application Installed event or stale previous version. Also save version name changes when the build number stays the same, so the next Application Updated event reports the latest previous version.
+
+## 3.79.0
+
+### Minor Changes
+
+- 1473c81: Support survey partial response collection. When enabled, submit cumulative answers after each question with a stable submission ID and completion status, matching posthog-js.
+  
+  Persist unfinished surveys across app restarts and restore the submission ID, saved answers, and next question. Completion, dismissal, SDK reset, and incompatible survey updates clear progress. Custom survey delegates opt in by returning `true` from `supportsSurveyResume` and must then honor `initialQuestionIndex`. Other delegates start fresh.
+  
+  Serialize progress updates with identity reset and reject callbacks from earlier survey attempts. Resumed completion and dismissal preserve the seen-survey history.
+  
+  Coordinate app-group survey persistence across processes with a durable reset epoch. Old writers and callbacks cannot restore progress after another SDK resets, including when the anonymous ID is reused. Progress records without an epoch are discarded.
+  
+  Preserve unfinished progress when remote configuration is unavailable, and clean up the configured survey delegate when closing the SDK.
+
+## 3.78.1
+
+### Patch Changes
+
+- 6d41bb5: Hide whitespace-only survey placeholders to match Android.
+
+## 3.78.0
+
+### Minor Changes
+
+- 6a4b140: Support survey targeting by a specific linked feature flag variant.
+
+## 3.77.1
+
+### Patch Changes
+
+- 985f3e0: Leave open-text survey inputs empty when no placeholder is configured.
+
+## 3.77.0
+
+### Minor Changes
+
+- 215f3e0: Support survey auto-submit on selection. Honor skipSubmitButton for ratings and single-choice questions without an open-ended choice, matching posthog-js, and expose the setting to custom survey delegates.
+
+## 3.76.0
+
+### Minor Changes
+
+- 177baa1: Add the internal `persistOptOut` config so a wrapper SDK that owns consent can stop a persisted opt-out from overriding the value it passes to `setup()`.
+
+### Patch Changes
+
+- 82ec3a1: Honor survey shuffleOptions in the built-in choice UI, keeping Other last and the display order stable while answering.
+
+## 3.75.2
+
+### Patch Changes
+
+- f5ec8cb: Stop session replay from redacting a screen that sits off screen behind a full-screen cover, which painted stale mask boxes over the covering screen.
+
+## 3.75.1
+
+### Patch Changes
+
+- 1ce6d86: Persist the person properties deduplication hash, so a repeated `identify()` or `setPersonProperties()` call with unchanged properties no longer sends a new `$set` event after each app relaunch.
+
+## 3.75.0
+
+### Minor Changes
+
+- f6cc720: Change `capturePushNotificationOpened` to skip a PostHog-sent notification open already captured in the last 5 minutes (same `invocation_id` and `action_id`), unless the notification's request identifier differs.
+
 ## 3.74.1
 
 ### Patch Changes
