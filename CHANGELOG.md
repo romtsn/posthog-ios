@@ -1,5 +1,53 @@
 ## Next
 
+## 3.85.0
+
+### Minor Changes
+
+- 0e299d4: Report out-of-memory terminations as `$exception` events on iOS 27 and later via MetricKit, when error tracking autocapture is enabled. Apps built with Xcode 26 or earlier don't include it.
+
+## 3.84.1
+
+### Patch Changes
+
+- ec8580d: Fix `$screen_width` and `$screen_height` going stale when the app window resizes (foldables, Stage Manager, iPad split view), and report the window's actual size on rotation in orientation-locked apps.
+
+## 3.84.0
+
+### Minor Changes
+
+- 932cf93: Add the `compression` config so an app can send request bodies uncompressed, e.g. when a managed work profile alters the compressed body in transit.
+
+## 3.83.0
+
+### Minor Changes
+
+- 2d35a0a: feat: expose the session replay debug map to first-party wrapper SDKs via `@_spi(PostHogInternal) PostHogSDK.sessionReplayDebugProperties()`
+
+## 3.82.0
+
+### Minor Changes
+
+- 61ae7ba: fix(push): unregister the device push subscription on `optOut()`
+  
+  `optOut()` stopped the SDK from sending new registrations but left the subscription stored on the person, so Workflows kept sending push notifications to a device whose user had opted out. Opting out unregisters the device (a durable DELETE that retries on `flush()`/next launch) and keeps the device token locally, so `optIn()` resubscribes without the app re-registering the token.
+  
+  Known edge case: a registration whose success response was lost is treated as never delivered, so an opt-out keeps an older pending unregister instead of replacing it. A per-identity queue of pending unregisters is the follow-up that closes it.
+
+## 3.81.0
+
+### Minor Changes
+
+- 6848def: Add opt-in SwiftUI tap autocapture with `captureSwiftUIElementInteractions`, disabled by default and independent of `captureElementInteractions`. Enable it for element-level SwiftUI labels and accessibility identifiers; opting in changes SwiftUI tap recognition and element chains. Existing interaction autocapture behavior is preserved when the new option is disabled.
+- 58372a7: Add `POSTHOG_FORCE` to `upload-symbols.sh`. Set it to `1` so the dSYM upload passes `--force` to posthog-cli (>= 0.7.12) and overwrites a symbol set that already exists with different content, instead of failing the build. It cannot be combined with `POSTHOG_SKIP_ON_CONFLICT`, which posthog-cli rejects.
+- ec980e3: Add captureAutocaptureElementText to optionally omit autocapture control text while preserving the existing default.
+
+## 3.80.0
+
+### Minor Changes
+
+- 64d1824: Attach `$recording_status` and `$sdk_debug_*` replay diagnostic properties to captured events, so error and exception events show whether session replay was recording.
+
 ## 3.79.1
 
 ### Patch Changes

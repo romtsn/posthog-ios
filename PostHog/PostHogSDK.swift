@@ -31,10 +31,17 @@ let maxRetryDelay = 30.0
 /// Use `PostHogSDK.shared` for the default singleton instance, or `PostHogSDK.with(_:)`
 /// to create an additional configured instance.
 @objc public class PostHogSDK: NSObject { // swiftlint:disable:this type_body_length
-    private(set) var config: PostHogConfig
+    private var _config: PostHogConfig
+    /// `config`/`remoteConfig`/`queue`/`replayQueue` are written under `setupLock` (setup/close) and
+    /// read from arbitrary caller threads (capture(), debugProperties()) — guard the references
+    /// themselves with the same (recursive) lock so a reader never races `close()`'s teardown.
+    private(set) var config: PostHogConfig {
+        get { setupLock.withLock { _config } }
+        set { setupLock.withLock { _config = newValue } }
+    }
 
     private init(_ config: PostHogConfig) {
-        self.config = config
+        _config = config
     }
 
     private var enabled = false
@@ -53,7 +60,12 @@ let maxRetryDelay = 30.0
     }
 
     private var pushSubscriptionHandler: PostHogPushSubscriptionHandler?
-    private var queue: PostHogQueue<PostHogEvent>?
+    private var _queue: PostHogQueue<PostHogEvent>?
+    private var queue: PostHogQueue<PostHogEvent>? {
+        get { setupLock.withLock { _queue } }
+        set { setupLock.withLock { _queue = newValue } }
+    }
+
     private let exceptionStepsBufferLock = NSLock()
     private var _exceptionStepsBuffer: PostHogExceptionStepsBuffer?
     /// The reference is written under `setupLock` (setup/close/optIn) and read from arbitrary caller
@@ -65,7 +77,12 @@ let maxRetryDelay = 30.0
     /// Fired with the buffer's current steps whenever they change. The error-tracking autocapture
     /// integration subscribes to mirror them into the crash reporter's `customData`.
     let onExceptionStepsChanged = PostHogMulticastCallback<[[String: Any]]>()
-    private(set) var replayQueue: PostHogReplayQueue?
+    private var _replayQueue: PostHogReplayQueue?
+    private(set) var replayQueue: PostHogReplayQueue? {
+        get { setupLock.withLock { _replayQueue } }
+        set { setupLock.withLock { _replayQueue = newValue } }
+    }
+
     private(set) var logsQueue: PostHogQueue<PostHogLogRecord>?
     private(set) var storage: PostHogStorage?
     private var surveyIdentityGeneration: String?
@@ -73,8 +90,13 @@ let maxRetryDelay = 30.0
         private var reachability: Reachability?
     #endif
     private var flagCallReported: [String: [Any?]] = .init()
-    private(set) var remoteConfig: PostHogRemoteConfig?
-    private var context: PostHogContext?
+    private var _remoteConfig: PostHogRemoteConfig?
+    private(set) var remoteConfig: PostHogRemoteConfig? {
+        get { setupLock.withLock { _remoteConfig } }
+        set { setupLock.withLock { _remoteConfig = newValue } }
+    }
+
+    private(set) var context: PostHogContext?
     private static var projectTokens = Set<String>()
     private var installedIntegrations: [PostHogIntegration] = []
     let sessionManager = PostHogSessionManager()
@@ -91,7 +113,14 @@ let maxRetryDelay = 30.0
     @objc public private(set) var logger: PostHogLogger?
 
     #if os(iOS)
-        private weak var replayIntegration: PostHogReplayIntegration?
+        private weak var _replayIntegration: PostHogReplayIntegration?
+        /// Same shape as `queue`/`replayQueue` above: written under `setupLock` by install/uninstall,
+        /// read from any caller thread by `buildProperties`.
+        private var replayIntegration: PostHogReplayIntegration? {
+            get { setupLock.withLock { _replayIntegration } }
+            set { setupLock.withLock { _replayIntegration = newValue } }
+        }
+
         private weak var surveysIntegration: PostHogSurveyIntegration?
     #endif
 
@@ -289,8 +318,9 @@ let maxRetryDelay = 30.0
                 }
             #endif
 
-            // Next-launch retry for a persisted, not-yet-delivered push subscription
-            // (no-ops while opted out, offline, or when the record was already delivered).
+            // Next-launch retry for a persisted, not-yet-delivered push subscription (no-ops while
+            // offline or when the record was already delivered). While opted out it unregisters a
+            // still-delivered record instead, covering `config.optOut = true` set before `setup()`.
             pushSubscriptionHandler?.retryIfNeeded()
 
             // Flush the queue when the app enters background to ensure
@@ -562,15 +592,45 @@ let maxRetryDelay = 30.0
         return true
     }
 
+    /// `$sdk_debug_session_start` / `$sdk_debug_current_session_duration` / `$sdk_debug_pending_queue_size`.
+    /// `at` is the event's resolved time, the same instant the session was resolved against: a
+    /// backdated capture that rotates the session reports 0, not the size of the backdate (js
+    /// measures against the latest snapshot's timestamp too). Clamped, since a backdated event
+    /// that doesn't rotate can predate the live session's start.
+    private func sessionDebugProperties(at eventTime: Date) -> [String: Any] {
+        var props: [String: Any] = [:]
+        if let sessionStart = sessionManager.sessionStartTimestampSnapshot {
+            let elapsed = eventTime.timeIntervalSince1970 - sessionStart
+            props["$sdk_debug_session_start"] = Int64(sessionStart * 1000)
+            props["$sdk_debug_current_session_duration"] = Int64(max(0, elapsed) * 1000)
+        }
+        if let depth = queue?.depth {
+            props["$sdk_debug_pending_queue_size"] = depth
+        }
+        return props
+    }
+
     private func buildProperties(distinctId: String,
                                  properties: [String: Any]?,
                                  userProperties: [String: Any]? = nil,
                                  userPropertiesSetOnce: [String: Any]? = nil,
                                  groups: [String: String]? = nil,
                                  appendSharedProps: Bool = true,
-                                 timestamp: Date? = nil) -> [String: Any]
+                                 timestamp: Date? = nil,
+                                 // Snapshot callers pass true: resolving the session read-only keeps a
+                                 // background crash-context refresh from rotating an idle session.
+                                 readOnlySession: Bool = false) -> [String: Any]
     {
         var props: [String: Any] = [:]
+
+        // Resolve the session before any $sdk_debug_* snapshot below: getSessionId(at:) can rotate
+        // here, so the debug keys must describe the session this event lands in (mirrors posthog-js).
+        // A caller-supplied $session_id wins so replay snapshots never land in the wrong session.
+        let eventTime = timestamp ?? now()
+        let propSessionId = properties?["$session_id"] as? String
+        let sessionId: String? = propSessionId.isNilOrEmpty
+            ? sessionManager.getSessionId(at: eventTime, readOnly: readOnlySession)
+            : propSessionId
 
         if appendSharedProps {
             let staticCtx = context?.staticContext()
@@ -603,6 +663,21 @@ let maxRetryDelay = 30.0
 
             props["$process_person_profile"] = hasPersonProcessing()
 
+            // SDK-computed debug keys overwrite a same-named registered super property (js: `extend`
+            // after super properties), so a stale `register()` can't shadow the live status.
+            #if os(iOS)
+                if let replayIntegration {
+                    props.merge(replayIntegration.debugProperties()) { _, new in new }
+                } else {
+                    props["$recording_status"] = "disabled"
+                    props["$sdk_debug_replay_capture_mode"] = PostHogReplayIntegration.captureMode(config: config)
+                    props["$sdk_debug_replay_throttle_delay_ms"] = PostHogReplayIntegration.throttleDelayMs(config: config)
+                }
+            #else
+                props["$recording_status"] = "disabled"
+            #endif
+            props.merge(sessionDebugProperties(at: eventTime)) { _, new in new }
+
             // Only stamp if the caller didn't supply a non-empty value —
             // `merging(properties)` below keeps the existing value on conflict,
             // so seeding would shadow a caller-supplied override. Whitespace-only
@@ -618,14 +693,6 @@ let maxRetryDelay = 30.0
         if sdkInfo != nil {
             props = props.merging(sdkInfo ?? [:]) { current, _ in current }
         }
-
-        // use existing session id if already present in properties (from params)
-        // for session replay, we attach the session id on the event as early as possible to avoid sending snapshots to a wrong session
-        // if not present, get a current or new session id at event timestamp
-        let propSessionId = properties?["$session_id"] as? String
-        let sessionId: String? = propSessionId.isNilOrEmpty
-            ? sessionManager.getSessionId(at: timestamp ?? now())
-            : propSessionId
 
         if let sessionId {
             if propSessionId.isNilOrEmpty {
@@ -867,13 +934,16 @@ let maxRetryDelay = 30.0
         // Read isIdentified, decide the transition, and persist it atomically so two
         // concurrent identify() calls on an anonymous user can't both see isIdentified
         // == false and each emit a person-processed event for the same transition.
+        // Read before taking identifyLock: `config`'s getter takes setupLock, and setup() holds
+        // setupLock while reaching identify(), so reading it inside would invert the two.
+        let reuseAnonymousId = config.reuseAnonymousId
         identifyLock.withLock {
             isIdentified = storageManager.isIdentified()
             hasDifferentDistinctId = distinctId != oldDistinctId
             shouldTransitionToIdentified = !hasDifferentDistinctId && !isIdentified
 
             if hasDifferentDistinctId, !isIdentified {
-                if !config.reuseAnonymousId {
+                if !reuseAnonymousId {
                     // We keep the AnonymousId to be used by flags calls and identify to link the previousId
                     storageManager.setAnonymousId(oldDistinctId)
                 }
@@ -2489,6 +2559,9 @@ let maxRetryDelay = 30.0
             return
         }
 
+        // Read `config` before taking optOutLock: its getter takes setupLock, and setup() holds
+        // setupLock while taking optOutLock, so reading it inside would invert the two.
+        let config = self.config
         optOutLock.withLock {
             config.optOut = false
             if config.persistOptOut {
@@ -2504,6 +2577,8 @@ let maxRetryDelay = 30.0
             notifyContextDidChange()
             notifyExceptionStepsDidChange()
         }
+
+        pushSubscriptionHandler?.onOptIn()
 
         #if os(iOS)
             // A prior logout unregister cleared the push token; opt-in re-installs the subscription
@@ -2522,6 +2597,9 @@ let maxRetryDelay = 30.0
     ///
     /// This persists the opt-out state, unless opt-out persistence is disabled, stops integrations,
     /// and causes future capture calls to be ignored.
+    /// It also unregisters this device's push subscription, so Workflows stop sending it notifications.
+    /// The device token itself is kept, so `optIn()` resubscribes this device on its own — on the next
+    /// `flush()` or launch at the latest — with no further call from the app.
     @objc public func optOut() {
         if !isEnabled() {
             return
@@ -2531,6 +2609,8 @@ let maxRetryDelay = 30.0
             return
         }
 
+        // Same lock-order reason as optIn(): hoist the setupLock-guarded read out of optOutLock.
+        let config = self.config
         optOutLock.withLock {
             config.optOut = true
             if config.persistOptOut {
@@ -2726,6 +2806,14 @@ let maxRetryDelay = 30.0
 
             return replayIntegration?.captureBridgeSnapshot(episodeFirstFrame: episodeFirstFrame) ?? false
         }
+
+        /// The per-event replay debug map (`$recording_status`, `$sdk_debug_replay_*`) that first-party
+        /// wrappers merge into events they build themselves; empty when replay is not installed.
+        ///
+        /// SPI, not public API: no stability guarantees.
+        @_spi(PostHogInternal) public func sessionReplayDebugProperties() -> [String: Any] {
+            replayIntegration?.debugProperties() ?? [:]
+        }
     #endif
 
     /// Creates and sets up an additional SDK instance.
@@ -2758,12 +2846,12 @@ let maxRetryDelay = 30.0
     #endif
 
     #if os(iOS) || targetEnvironment(macCatalyst)
-        /// Returns whether UIKit element autocapture is enabled in local state.
+        /// Returns whether UIKit or SwiftUI element autocapture is enabled in local state.
         ///
-        /// - Returns: `true` when the SDK is set up and `captureElementInteractions` is enabled.
+        /// - Returns: `true` when the SDK is set up and either interaction autocapture option is enabled.
         ///   This does not verify that the swizzling-backed integration was installed.
         @objc public func isAutocaptureActive() -> Bool {
-            isEnabled() && config.captureElementInteractions
+            isEnabled() && (config.captureElementInteractions || config.captureSwiftUIElementInteractions)
         }
 
         /// Returns whether rage click autocapture is enabled in local state.
@@ -3023,6 +3111,9 @@ let maxRetryDelay = 30.0
 
             installedIntegrations.append(integration)
             replayIntegration = integration
+            // install() already ran start(), whose crash-context snapshot saw `replayIntegration == nil`
+            // and stamped "disabled"; re-snapshot now that the property is set.
+            notifyContextDidChange()
 
             hedgeLog("Integration \(type(of: integration)) installed")
         }
@@ -3066,25 +3157,38 @@ let maxRetryDelay = 30.0
         #endif
     }
 
+    /// Point-in-time counters: the crash path replays the context snapshot verbatim on the next
+    /// launch, so these would be stale by definition. Status/config keys stay because the replay
+    /// integration re-notifies on every recording transition.
+    private static let pointInTimeDebugKeys = [
+        "$sdk_debug_current_session_duration",
+        "$sdk_debug_pending_queue_size",
+        "$sdk_debug_replay_internal_buffer_length",
+    ]
+
     /// Notifies all installed integrations that the event context has changed.
     ///
-    /// This is called after operations that modify the context (identify, reset, group, register).
-    /// Integrations like crash reporting use this to persist context for crash-time capture.
-    private func notifyContextDidChange() {
+    /// This is called after operations that modify the context (identify, reset, group, register)
+    /// and by the replay integration whenever `$recording_status` changes. Integrations like crash
+    /// reporting use this to persist context for crash-time capture.
+    func notifyContextDidChange() {
         guard isEnabled() else { return }
 
         let distinctId = getDistinctId()
 
-        // Build complete event properties snapshot
-        let eventProperties = buildProperties(
+        var eventProperties = buildProperties(
             distinctId: distinctId,
             properties: nil,
             userProperties: nil,
             userPropertiesSetOnce: nil,
             groups: nil,
             appendSharedProps: true,
-            timestamp: nil
+            timestamp: nil,
+            readOnlySession: true
         )
+        for key in Self.pointInTimeDebugKeys {
+            eventProperties.removeValue(forKey: key)
+        }
 
         // Build crash context with identity info + event properties
         // This structure allows crash reporting to reconstruct events with crash-time data
@@ -3152,13 +3256,15 @@ let maxRetryDelay = 30.0
         /// Unregisters this device's push token from PostHog so Workflows stop targeting it — for example
         /// from your logout flow.
         ///
-        /// Sends a `DELETE /api/push_subscriptions/` for the current distinct id (the backend unsets the
-        /// subscription property) and forgets the locally stored token. The delete intent is durable: an
-        /// offline or failed attempt is retried on `flush()`/next launch until it succeeds or hits a
-        /// terminal 4xx. Call it directly if you manage push subscriptions yourself. On `reset()` the SDK
-        /// already moves any registered token to the new anonymous identity (unregister then re-register),
-        /// independently of `capturePushNotificationSubscriptions` — that flag only gates automatic token
-        /// subscription at startup.
+        /// Sends a `DELETE /api/push_subscriptions/` for the identity the token was delivered to — the
+        /// current distinct id when nothing was delivered yet — so the backend unsets the subscription
+        /// property on the person that actually holds it, and forgets the locally stored token. The
+        /// delete intent is durable: an offline or failed attempt is retried on `flush()`/next launch
+        /// until it succeeds or hits a terminal 4xx. Call it directly if you manage push subscriptions
+        /// yourself. On `reset()` the SDK already moves any registered token to the new anonymous
+        /// identity (unregister then re-register), independently of
+        /// `capturePushNotificationSubscriptions` — that flag only gates automatic token subscription
+        /// at startup.
         @objc public func unregisterPushNotificationToken() {
             if !isEnabled() {
                 return

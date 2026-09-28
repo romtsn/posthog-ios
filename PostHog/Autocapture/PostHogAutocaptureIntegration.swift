@@ -15,6 +15,13 @@
 
         private weak var postHog: PostHogSDK?
         private var debounceTimers: [Int: Timer] = [:]
+        private lazy var swiftUITaps = SwiftUITapAutocapture(processor: self)
+
+        var captureSwiftUIElementInteractions: Bool {
+            postHog?.config.captureSwiftUIElementInteractions == true
+        }
+
+        var captureElementText: Bool { postHog?.config.captureAutocaptureElementText ?? true }
 
         func install(_ postHog: PostHogSDK) -> PostHogIntegrationInstallResult {
             installIfNeeded(using: Self.integrationInstallState) {
@@ -37,14 +44,18 @@
          */
         func start() {
             PostHogAutocaptureEventTracker.eventProcessor = self
+            swiftUITaps.setEnabled(captureSwiftUIElementInteractions)
+            PostHogLabelTaggerView.refreshAll()
         }
 
         /**
          Disables the autocapture integration by clearing the PostHogAutocaptureEventTracker routing
          */
         func stop() {
+            swiftUITaps.setEnabled(false)
             if PostHogAutocaptureEventTracker.eventProcessor != nil {
                 PostHogAutocaptureEventTracker.eventProcessor = nil
+                PostHogLabelTaggerView.refreshAll()
                 debounceTimers.values.forEach { $0.invalidate() }
                 debounceTimers.removeAll()
             }
@@ -66,6 +77,14 @@
                 return
             }
 
+            switch source {
+            case .swiftUITap:
+                guard captureSwiftUIElementInteractions else { return }
+            default:
+                guard postHog?.config.captureElementInteractions == true else { return }
+            }
+
+            swiftUITaps.cancel()
             let eventHash = event.viewHierarchy.map(\.targetClass).hashValue
             // debounce frequent UIControl events (e.g., UISlider) to reduce event noise
             if event.debounceInterval > 0 {
@@ -96,6 +115,7 @@
             }
 
             let eventType: String = switch source {
+            case .swiftUITap: EventType.kTouch
             case let .actionMethod(description): description
             case let .gestureRecognizer(description): description
             case let .notification(name): name
@@ -107,7 +127,7 @@
                 properties["$screen_name"] = screenName
             }
 
-            let elementsChain = event.getElementChain()
+            let elementsChain = event.getElementChain(captureElementText: captureElementText)
 
             if let coordinates = event.touchCoordinates {
                 properties["$touch_x"] = coordinates.x
