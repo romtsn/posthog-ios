@@ -90,20 +90,10 @@ swiftFormatCheck: installSwiftFormat
 	swiftformat . --lint --swiftversion 5.3
 
 # use -only-testing:PostHogTests/PostHogQueueTest to run only a specific test
-# -retry-tests-on-failure -test-iterations 3: a few tests assert real-time behaviour (autocapture
-# debounce/flush windows) that can't be made deterministic; on slow, load-variable CI runners those
-# windows occasionally slip. Rerun a *failed* test up to 3 times so a transient miss doesn't fail the
-# job — a genuinely broken test fails all 3 and stays red. Retries can *mask* flakiness, so we tee the
-# raw log to xcodebuild-ios.log; CI reads it back to surface tests that only passed after a retry (the
-# macOS `test` job runs without retries, so a genuine flake still hard-fails there).
+# Runs the suite once, then reruns only failed XCTest cases in a fresh process. Swift Testing
+# failures are never retried, since rerunning those suites reinstalls irreversible swizzles.
 testOniOSSimulator:
-	@device="$$(xcrun simctl list devices available | grep -E '^[[:space:]]*iPhone' | head -1 | sed -E 's/^[[:space:]]*//; s/ \(.*//')"; \
-	[ -n "$$device" ] || { echo "No available iPhone simulator found; install one via Xcode or 'xcrun simctl create'."; exit 1; }; \
-	echo "Testing on simulator: $$device"; \
-	set -o pipefail; \
-	xcrun xcodebuild test -scheme PostHog -destination "platform=iOS Simulator,name=$$device" -retry-tests-on-failure -test-iterations 3 | tee xcodebuild-ios.log | xcpretty; \
-	status=$$?; \
-	scripts/check-ios-test-result.sh "$$status" xcodebuild-ios.log
+	scripts/test-ios-simulator.sh xcodebuild-ios.log
 
 # Mounted interaction tests use a small test host and the SDK's real survey views.
 # Override SURVEY_UI_DESTINATION to select an installed simulator explicitly.
@@ -133,6 +123,23 @@ testPresentationMasks:
 	  2>&1 | tee presentation-masks.log | xcpretty
 	@grep -q 'Suite "Replay masking behind a cover" passed' presentation-masks.log
 	@grep -q 'Suite "Replay presentation privacy" passed' presentation-masks.log
+
+.PHONY: testCameraReplay
+
+# Opt-in system camera regression; requires an app host and a camera-capable runtime.
+# Pass CAMERA_REPLAY_DESTINATION to select the simulator/device and CAMERA_REPLAY_XCODEBUILD_ARGS
+# for local build overrides. Regular controller-exclusion tests also run in the normal suite.
+testCameraReplay:
+	set -o pipefail && xcrun xcodebuild test -project PostHog.xcodeproj -scheme PostHog \
+	  -destination "$(CAMERA_REPLAY_DESTINATION)" -parallel-testing-enabled NO \
+	  POSTHOG_PRESENTATION_TEST_HOST='$$(BUILT_PRODUCTS_DIR)/PostHogExample.app/PostHogExample' \
+	  INFOPLIST_KEY_NSCameraUsageDescription='Test replay capture while the camera is open.' \
+	  SWIFT_ACTIVE_COMPILATION_CONDITIONS='$$(inherited) TEST_CAMERA_REPLAY' \
+	  -only-testing:PostHogTests/PostHogReplayCameraTest \
+	  -only-testing:PostHogTests/PostHogSystemCameraReplayTest \
+	  $(CAMERA_REPLAY_XCODEBUILD_ARGS) 2>&1 | tee camera-replay.log | xcpretty
+	@grep -q 'Suite "System camera replay regression" passed' camera-replay.log
+	@grep -q 'Suite "Replay camera exclusion" passed' camera-replay.log
 
 testOnMacSimulator:
 	set -o pipefail && xcrun xcodebuild test -scheme PostHog -destination 'platform=macOS' | xcpretty
@@ -186,7 +193,11 @@ recordMaskSnapshots: checkMaskSnapshotRuntime
 testUploadSymbols:
 	build-tools/upload-symbols.test.sh
 
-test: testUploadSymbols
+.PHONY: testIOSResultParser
+testIOSResultParser:
+	bash scripts/check-ios-test-result.test.sh
+
+test: testUploadSymbols testIOSResultParser
 	set -o pipefail && swift test --no-parallel -Xswiftc -DTESTING $(if $(filter),--filter $(filter))
 
 recordEventShapeSnapshots:

@@ -1,5 +1,106 @@
 ## Next
 
+## 3.89.1
+
+### Patch Changes
+
+- 92f1abe: Remove the `RCTFatalException` default from `errorTrackingConfig.ignoredExceptionTypes` and correct its documentation. The default never matched the exception React Native raises for a fatal JS error, which is named `"RCTFatalException: <message>"`, so it filtered nothing. The option now defaults to `[]`. The PostHog React Native plugin removes these duplicates where it can (old architecture, and new architecture on React Native 0.83.5+ / 0.85+). On earlier new-architecture versions a native `SIGABRT` duplicate can still appear. If your app relied on filtering an exception named exactly `RCTFatalException`, add it back with `config.errorTrackingConfig.ignoredExceptionTypes = ["RCTFatalException"]`.
+
+## 3.89.0
+
+### Minor Changes
+
+- aca7e84: Add `PostHogSDK.onFeatureFlags(_:)` to run a callback on the main thread whenever feature flags load or change, including from bootstrap values. The callback receives a `PostHogFeatureFlagsLoaded` with the enabled flag keys, their values and whether loading failed, and runs shortly after you register if flags have already loaded. Call `unsubscribe()` on the returned `PostHogFeatureFlagsSubscription` to stop listening.
+
+## 3.88.2
+
+### Patch Changes
+
+- 9deadc5: Discard session replay screenshots while the system camera picker is open to avoid an iOS CameraUI layer-copy crash. Screenshot capture resumes after the camera is dismissed.
+- ae6063c: Split session replay uploads at session or distinct ID changes so queued snapshots retain their session and identity attribution. Send the boundary-separated groups within a flush's batch limit sequentially without waiting for another flush trigger.
+
+## 3.88.1
+
+### Patch Changes
+
+- 1557aac: Fix surveys with a question type this SDK version can't display getting stuck on an empty sheet after the last answer; such surveys are now skipped.
+
+## 3.88.0
+
+### Minor Changes
+
+- b3e7772: Add the `disableGeoIp` config so an app can opt out of server-side GeoIP enrichment. When enabled, captured events carry `$geoip_disable` and feature flag requests send `geoip_disable`, so the server doesn't infer the user's location from their IP address.
+
+## 3.87.0
+
+### Minor Changes
+
+- a60a2b0: Deprecate APIs that PostHog 4.0 hides or removes, and announce iOS 15 as the minimum iOS version in 4.0.
+  
+  Becoming SDK-internal in 4.0 (wrapper SDKs can keep using them by importing PostHog with `@_spi(PostHogInternal)`):
+  
+  - `PostHogSessionManager.shared` and `setSessionId(_:)`: use `PostHogSDK.getSessionId()`, `startSession()` and `endSession()`.
+  - `dateToMillis(_:)` and `imageToBase64(_:_:)`
+  
+  Removed from the public API in 4.0:
+  
+  - `UIColor.hexDescription(_:)`
+  
+  These also change in 4.0 but show no deprecation warning in 3.x, because the SDK uses them internally:
+  
+  - Becoming SDK-internal: `postHogSdkName`, `postHogVersion`, `PostHogConfig.storageManager` and `PostHogConfig.snapshotEndpoint`.
+  - Removed from the public API: `toISO8601String(_:)`, `toISO8601Date(_:)`, `sanitizeDictionary(_:)`, `deleteSafely(_:)`, `postHogiOSSdkName`, `UIColor.init(hex:)`, `Gzip`, `GzipError`, `CompressionLevel` and `ReachabilityError`.
+  
+  PostHog 4.0 raises the minimum iOS deployment target from 13.0 to 15.0. The macOS, tvOS, watchOS and visionOS minimums are unchanged.
+
+## 3.86.3
+
+### Patch Changes
+
+- 35a5caa: Fix automatic screen views capturing duplicate or wrongly named `$screen` events, such as SwiftUI's `_UnaryViewAdaptor<EmptyView>` placeholder, when the device is rotated, folded or unfolded. A screen that appears again without the visible screen changing is no longer captured twice, so navigating inside a split view that shows several columns no longer repeats the split view's `$screen` event. To track the screens inside a column of such a split view, call `screen()` manually.
+- edd15c0: Complete a survey when the last question's branching is `next_question`, or when response-based branching has no match for the answer. The survey no longer stays on that question after it is answered.
+
+## 3.86.2
+
+### Patch Changes
+
+- 9dec867: Keep nested dates and URLs when sanitizing event properties. A `Date` or `URL` inside a dictionary or array is converted the same way as a top-level value, and the surrounding fields are no longer dropped with it.
+
+## 3.86.1
+
+### Patch Changes
+
+- f0d1260: Fix `sessionReplay = false` so remote config loads, event triggers and session changes no longer restart a recording the app stopped with `stopSessionRecording()`; a manual `startSessionRecording()` keeps recording into new sessions until the app stops it, matching Android
+- 509140d: Stop session replay when the project is over its mobile session replay quota. The SDK now treats `quotaLimited: ["mobile_recordings"]` in remote config the same as `sessionRecording: false`.
+
+## 3.86.0
+
+### Minor Changes
+
+- b3b42e2: Add `$hinge_status` (`closed`, `partially_open` or `fully_open`) to events on foldable iPhones running iOS 27.1 or later, in apps built with Xcode 27.1 or later.
+
+### Patch Changes
+
+- e897380: Fix survey sheets being sized against the device's main screen instead of the app's window, which could show a sheet at half height or too tall to fit on foldables and in resizable iPad windows.
+
+## 3.85.3
+
+### Patch Changes
+
+- b3b6ee4: Fix apps with Apple's Enhanced Security capability being killed at launch when error tracking autocapture is enabled.
+
+## 3.85.2
+
+### Patch Changes
+
+- 25b5a4b: Fix session replay keeping the original screen size after the app's window is resized, such as when it rotates or a foldable iPhone is folded or unfolded.
+
+## 3.85.1
+
+### Patch Changes
+
+- 08290dc: Fix a deadlock when session replay is linked to a feature flag. The `$feature_flag_called` capture now runs after `sessionReplayLock` is released, so setup and replay config can no longer wait on each other.
+
 ## 3.85.0
 
 ### Minor Changes

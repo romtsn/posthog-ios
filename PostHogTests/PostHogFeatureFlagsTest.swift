@@ -283,6 +283,8 @@ enum PostHogFeatureFlagsTest {
             // Person properties should be empty or only contain default properties (not "plan")
             let requestPersonProps = requestBody["person_properties"] as? [String: Any]
             #expect(requestPersonProps?["plan"] == nil, "Expected 'plan' to be cleared from person properties")
+            let requestGroupProps = requestBody["group_properties"] as? [String: [String: Any]]
+            #expect(requestGroupProps?["company"]?["name"] == nil)
         }
     }
 
@@ -374,7 +376,7 @@ enum PostHogFeatureFlagsTest {
         }
 
         @Test("Reset person properties clears all properties")
-        func resetPersonPropertiesClearsAll() async {
+        func resetPersonPropertiesClearsAll() async throws {
             let sut = track(PostHogSDK.with(config))
 
             // Set some properties
@@ -402,11 +404,9 @@ enum PostHogFeatureFlagsTest {
             }
 
             // After reset, person_properties should only contain default device properties, not the custom ones
-            if let personProperties = requestBody["person_properties"] as? [String: Any] {
-                #expect(personProperties["property1"] == nil, "Expected property1 to be removed after reset")
-                #expect(personProperties["property2"] == nil, "Expected property2 to be removed after reset")
-                // Device properties like $device_manufacturer, $os_name etc. are expected to remain
-            }
+            let personProperties = try #require(requestBody["person_properties"] as? [String: Any])
+            #expect(personProperties["property1"] == nil, "Expected property1 to be removed after reset")
+            #expect(personProperties["property2"] == nil, "Expected property2 to be removed after reset")
         }
 
         @Test("Group properties are stored and retrieved correctly")
@@ -827,7 +827,7 @@ enum PostHogFeatureFlagsTest {
         }
 
         @Test("getFeatureFlag returns consistent values with getFeatureFlagResult")
-        func getFeatureFlagReturnsSameValue() async {
+        func getFeatureFlagReturnsSameValue() async throws {
             let sut = track(PostHogSDK.with(config))
 
             await withCheckedContinuation { continuation in
@@ -837,14 +837,16 @@ enum PostHogFeatureFlagsTest {
             }
 
             // Boolean flag: getFeatureFlag returns Bool, getFeatureFlagResult has enabled
-            let boolResult = sut.getFeatureFlagResult("bool-value", sendFeatureFlagEvent: false)
-            let boolValue = sut.getFeatureFlag("bool-value", sendFeatureFlagEvent: false)
-            #expect(boolResult?.enabled == boolValue as? Bool)
+            let boolResult = try #require(sut.getFeatureFlagResult("bool-value", sendFeatureFlagEvent: false))
+            let boolValue = try #require(sut.getFeatureFlag("bool-value", sendFeatureFlagEvent: false) as? Bool)
+            #expect(boolResult.enabled == boolValue)
+            #expect(boolValue)
 
             // Variant flag: getFeatureFlag returns variant String, getFeatureFlagResult has variant
-            let stringResult = sut.getFeatureFlagResult("string-value", sendFeatureFlagEvent: false)
-            let stringValue = sut.getFeatureFlag("string-value", sendFeatureFlagEvent: false)
-            #expect(stringResult?.variant == stringValue as? String)
+            let stringResult = try #require(sut.getFeatureFlagResult("string-value", sendFeatureFlagEvent: false))
+            let stringValue = try #require(sut.getFeatureFlag("string-value", sendFeatureFlagEvent: false) as? String)
+            #expect(stringResult.variant == stringValue)
+            #expect(!stringValue.isEmpty)
 
             sut.close()
         }
@@ -906,13 +908,16 @@ enum PostHogFeatureFlagsTest {
         }
 
         @Test("each result matches getFeatureFlagResult for that key")
-        func matchesSingleKeyResult() async {
+        func matchesSingleKeyResult() async throws {
             let sut = track(PostHogSDK.with(config))
             await withCheckedContinuation { continuation in
                 sut.reloadFeatureFlags { continuation.resume() }
             }
 
-            for flag in sut.getAllFeatureFlags() ?? [] {
+            let flags = try #require(sut.getAllFeatureFlags())
+            try #require(flags.contains { $0.key == "bool-value" })
+            try #require(flags.contains { $0.key == "string-value" })
+            for flag in flags {
                 let single = sut.getFeatureFlagResult(flag.key, sendFeatureFlagEvent: false)
                 #expect(flag.enabled == single?.enabled, "enabled mismatch for \(flag.key)")
                 #expect(flag.variant == single?.variant, "variant mismatch for \(flag.key)")
@@ -1376,13 +1381,13 @@ enum PostHogFeatureFlagsTest {
             let flagsLoaded = AsyncLatch()
             var receivedFlags: [String: Any]?
 
-            // @MainActor keeps this deterministic: init fires the notify on the main queue, which can't
-            // run until we suspend at `await` below, so the subscription is always registered first.
+            // The SDK fires the bootstrap notification after subscribing its listeners; mirror that here.
             let sut = getSut(storage: freshStorage(config), config: config)
             let token = sut.onFeatureFlagsLoaded.subscribe { flags in
                 receivedFlags = flags
                 flagsLoaded.signal()
             }
+            sut.notifyBootstrappedFlagsIfSeeded()
 
             await flagsLoaded.wait()
 
@@ -1469,7 +1474,11 @@ enum PostHogFeatureFlagsTest {
         }
     }
 
-    @Suite("Test concurrent flag reload coalescing", .timeLimit(.minutes(1)))
+    #if SWIFT_PACKAGE
+        @Suite("Test concurrent flag reload coalescing", .timeLimit(.minutes(1)))
+    #else
+        @Suite("Test concurrent flag reload coalescing")
+    #endif
     class TestConcurrentFlagReloads: BaseTestClass {
         /// Held by the first `/flags` response until the test has issued the reloads that must
         /// coalesce behind it. Wall-clock delays leave that window to chance; this makes it certain.
@@ -1619,6 +1628,308 @@ enum PostHogFeatureFlagsTest {
             config.captureApplicationLifecycleEvents = false
             config.captureScreenViews = false
             config.sendFeatureFlagEvent = false
+            return config
+        }
+    }
+
+    @Suite("Test onFeatureFlags")
+    class TestOnFeatureFlags: BaseTestClass {
+        /// Waits for the main-queue delivery that follows a completed reload.
+        private func reload(_ sut: PostHogSDK) async {
+            await withCheckedContinuation { continuation in
+                sut.reloadFeatureFlags { continuation.resume() }
+            }
+            await MainActor.run {}
+        }
+
+        @Test("passes enabled flags and variants when flags load")
+        func invokedOnLoad() async {
+            let sut = track(PostHogSDK.with(config))
+            var received: [PostHogFeatureFlagsLoaded] = []
+            sut.onFeatureFlags { received.append($0) }
+
+            await reload(sut)
+
+            #expect(received.count == 1)
+            #expect(received.first?.errorsLoading == false)
+            #expect(received.first?.variants["bool-value"] as? Bool == true)
+            #expect(received.first?.variants["string-value"] as? String == "test")
+            #expect(received.first?.flags.contains("string-value") == true)
+            // disabled flags are left out, matching posthog-js
+            #expect(received.first?.flags.contains("disabled-flag") == false)
+            #expect(received.first?.variants["disabled-flag"] == nil)
+        }
+
+        @Test("invokes a listener registered after flags loaded with the current values")
+        func lateListener() async {
+            let sut = track(PostHogSDK.with(config))
+            await reload(sut)
+
+            let loaded = await withCheckedContinuation { continuation in
+                sut.onFeatureFlags { continuation.resume(returning: $0) }
+            }
+
+            #expect(loaded.variants["string-value"] as? String == "test")
+        }
+
+        @Test("stops invoking a listener after unsubscribe")
+        func unsubscribe() async {
+            let sut = track(PostHogSDK.with(config))
+            var count = 0
+            let subscription = sut.onFeatureFlags { _ in count += 1 }
+
+            subscription.unsubscribe()
+            await reload(sut)
+
+            #expect(count == 0)
+        }
+
+        @Test("reports errorsLoading with the last known flags when the request fails")
+        func errorsLoading() async {
+            let sut = track(PostHogSDK.with(config))
+            await reload(sut)
+
+            server.flagsResponseHandler = { _ in
+                HTTPStubsResponse(jsonObject: [], statusCode: 500, headers: nil)
+            }
+            var received: [PostHogFeatureFlagsLoaded] = []
+            sut.onFeatureFlags { received.append($0) }
+            await reload(sut)
+
+            // first: replay of the loaded flags on registration; last: the failed reload
+            #expect(received.last?.errorsLoading == true)
+            #expect(received.last?.variants["string-value"] as? String == "test")
+        }
+
+        @Test("a listener registered while a delivery is queued on main ends on the newest values")
+        func lateListenerAfterQueuedDelivery() async {
+            let sut = track(PostHogSDK.with(config))
+            await reload(sut)
+
+            server.flagsResponseHandler = { _ in
+                let body: [String: Any] = [
+                    "featureFlags": ["string-value": "v2"],
+                    "featureFlagPayloads": [String: Any](),
+                    "errorsWhileComputingFlags": false,
+                ]
+                return HTTPStubsResponse(jsonObject: body, statusCode: 200, headers: nil)
+            }
+            // Hold main so the reload's delivery is still queued when the listener registers
+            let mainBlocked = DispatchSemaphore(value: 0)
+            DispatchQueue.main.async { _ = mainBlocked.wait(timeout: .now() + 5) }
+
+            var received: [PostHogFeatureFlagsLoaded] = []
+            await withCheckedContinuation { continuation in
+                sut.reloadFeatureFlags {
+                    sut.onFeatureFlags { received.append($0) }
+                    mainBlocked.signal()
+                    continuation.resume()
+                }
+            }
+            await MainActor.run {}
+
+            #expect(received.last?.variants["string-value"] as? String == "v2")
+        }
+
+        @Test("a listener registered before setup receives bootstrap flags when setup runs off main")
+        func bootstrapOffMain() async {
+            // An instance with no flag state; listeners survive close() and setup()
+            let sut = track(PostHogSDK.with(config))
+            sut.close()
+
+            var received: [PostHogFeatureFlagsLoaded] = []
+            sut.onFeatureFlags { received.append($0) }
+
+            await withCheckedContinuation { continuation in
+                DispatchQueue.global().async {
+                    sut.setup(self.makeBootstrapConfig())
+                    continuation.resume()
+                }
+            }
+            await MainActor.run {}
+
+            #expect(received.contains { $0.variants["beta-ui"] as? Bool == true && !$0.errorsLoading })
+        }
+
+        @Test("a listener registered right after setup on main receives bootstrap flags once")
+        func bootstrapOnMainDeliveredOnce() async {
+            let sut = track(PostHogSDK.with(config))
+            sut.close()
+
+            // setup() and registration in the same main-thread turn, as in didFinishLaunching
+            var received: [PostHogFeatureFlagsLoaded] = []
+            await withCheckedContinuation { continuation in
+                DispatchQueue.main.async {
+                    sut.setup(self.makeBootstrapConfig())
+                    sut.onFeatureFlags { received.append($0) }
+                    continuation.resume()
+                }
+            }
+            await MainActor.run {}
+            await MainActor.run {}
+
+            #expect(received.count == 1)
+            #expect(received.first?.variants["beta-ui"] as? Bool == true)
+        }
+
+        @Test("does not replay the previous user's flags after reset")
+        func noReplayAfterReset() async {
+            let sut = track(PostHogSDK.with(config))
+            await reload(sut)
+
+            // Skip the reload that reset() starts, so only the cleared cache is observed
+            sut.remoteConfig?.canReloadFlagsForTesting = false
+            sut.reset()
+
+            var received: [PostHogFeatureFlagsLoaded] = []
+            sut.onFeatureFlags { received.append($0) }
+            await MainActor.run {}
+
+            #expect(received.isEmpty)
+        }
+
+        @Test("drops a delivery queued before reset")
+        func dropsDeliveryQueuedBeforeReset() async {
+            let sut = track(PostHogSDK.with(config))
+            await reload(sut)
+
+            var received: [PostHogFeatureFlagsLoaded] = []
+            sut.onFeatureFlags { received.append($0) }
+            await MainActor.run {}
+            let before = received.count
+
+            // Hold main so the reload's delivery is still queued when reset() clears the flags
+            let mainBlocked = DispatchSemaphore(value: 0)
+            DispatchQueue.main.async { _ = mainBlocked.wait(timeout: .now() + 5) }
+            await withCheckedContinuation { continuation in
+                sut.reloadFeatureFlags {
+                    sut.remoteConfig?.canReloadFlagsForTesting = false
+                    sut.reset()
+                    sut.onFeatureFlags { received.append($0) }
+                    mainBlocked.signal()
+                    continuation.resume()
+                }
+            }
+            await MainActor.run {}
+
+            #expect(received.count == before)
+        }
+
+        @Test("does not call a listener unsubscribed by another listener during the same delivery")
+        func unsubscribedDuringDelivery() async {
+            let sut = track(PostHogSDK.with(config))
+            var subscriptionA: PostHogFeatureFlagsSubscription?
+            var subscriptionB: PostHogFeatureFlagsSubscription?
+            var countA = 0
+            var countB = 0
+            // Whichever runs first unsubscribes the other, so exactly one of them is called
+            subscriptionA = sut.onFeatureFlags { _ in
+                countA += 1
+                subscriptionB?.unsubscribe()
+            }
+            subscriptionB = sut.onFeatureFlags { _ in
+                countB += 1
+                subscriptionA?.unsubscribe()
+            }
+
+            await reload(sut)
+
+            #expect(countA + countB == 1)
+        }
+
+        @Test("does not deliver an update to the remaining listeners after a listener calls reset()")
+        func resetFromListener() async {
+            let sut = track(PostHogSDK.with(config))
+            var countA = 0
+            var countB = 0
+            var didReset = false
+            // Whichever runs first resets, so the other must not get the invalidated update
+            let resetOnce = {
+                guard !didReset else { return }
+                didReset = true
+                sut.remoteConfig?.canReloadFlagsForTesting = false
+                sut.reset()
+            }
+            sut.onFeatureFlags { _ in
+                countA += 1
+                resetOnce()
+            }
+            sut.onFeatureFlags { _ in
+                countB += 1
+                resetOnce()
+            }
+
+            await reload(sut)
+            #expect(countA + countB == 1)
+
+            sut.remoteConfig?.canReloadFlagsForTesting = true
+            await reload(sut)
+            #expect(countA + countB == 3)
+        }
+
+        @Test("does not deliver an update to the remaining listeners after a listener calls close()")
+        func closeFromListener() async {
+            let sut = track(PostHogSDK.with(config))
+            var countA = 0
+            var countB = 0
+            var didClose = false
+            let closeOnce = {
+                guard !didClose else { return }
+                didClose = true
+                sut.close()
+            }
+            sut.onFeatureFlags { _ in
+                countA += 1
+                closeOnce()
+            }
+            sut.onFeatureFlags { _ in
+                countB += 1
+                closeOnce()
+            }
+
+            await reload(sut)
+            #expect(countA + countB == 1)
+
+            sut.setup(config)
+            await reload(sut)
+            #expect(countA + countB == 3)
+        }
+
+        @Test("keeps errorsLoading from a failed load when the bootstrap notification arrives after it")
+        func bootstrapAfterFailureKeepsErrorsLoading() async {
+            let sut = track(PostHogSDK.with(makeBootstrapConfig()))
+            var received: [PostHogFeatureFlagsLoaded] = []
+            sut.onFeatureFlags { received.append($0) }
+            await MainActor.run {}
+
+            server.flagsResponseHandler = { _ in
+                HTTPStubsResponse(jsonObject: [], statusCode: 500, headers: nil)
+            }
+            await reload(sut)
+            #expect(received.last?.errorsLoading == true)
+
+            // A startup failure can reach listeners before the deferred bootstrap notification
+            sut.remoteConfig?.bootstrapNotifyPending = true
+            sut.remoteConfig?.notifyBootstrappedFlagsIfSeeded()
+            await MainActor.run {}
+
+            #expect(received.last?.errorsLoading == true)
+            #expect(received.last?.variants["beta-ui"] as? Bool == true)
+
+            let replayed = await withCheckedContinuation { continuation in
+                sut.onFeatureFlags { continuation.resume(returning: $0) }
+            }
+            #expect(replayed.errorsLoading == true)
+        }
+
+        private func makeBootstrapConfig() -> PostHogConfig {
+            let config = PostHogConfig(projectToken: "test_project_token", host: "http://localhost:9001")
+            config.preloadFeatureFlags = false
+            config.disableReachabilityForTesting = true
+            config.disableQueueTimerForTesting = true
+            config.disableFlushOnBackgroundForTesting = true
+            config.disableRemoteConfigForTesting = true
+            config.bootstrap = PostHogBootstrapConfig(featureFlags: ["beta-ui": true], featureFlagPayloads: nil)
             return config
         }
     }

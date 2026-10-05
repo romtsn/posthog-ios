@@ -380,7 +380,7 @@ class PostHogSDKTest: QuickSpec {
         }
 
         #if os(iOS)
-            it("captures $recording_status and $sdk_debug_* debug properties on custom, screen, and exception events") {
+            it("captures $recording_status on every event and the full replay debug bundle on the first eligible SDK event only") {
                 server.reset(batchCount: 1)
                 let sut = self.getSut(flushAt: 3)
 
@@ -391,12 +391,20 @@ class PostHogSDKTest: QuickSpec {
                 let events = getBatchedEvents(server)
                 expect(events.count) == 3
 
+                expect(events[0].properties["$recording_status"] as? String) == "disabled"
+                expect(events[0].properties["$sdk_debug_session_start"]).to(beNil())
+                expect(events[0].properties["$sdk_debug_replay_capture_mode"]).to(beNil())
+
+                expect(events[1].properties["$recording_status"] as? String) == "disabled"
+                expect(events[1].properties["$sdk_debug_replay_capture_mode"] as? String) == "wireframe"
+                expect(events[1].properties["$sdk_debug_session_start"]).toNot(beNil())
+
+                // Inside the 30s window opened by $screen.
+                expect(events[2].properties["$recording_status"] as? String) == "disabled"
+                expect(events[2].properties["$sdk_debug_session_start"]).to(beNil())
+                expect(events[2].properties["$sdk_debug_replay_capture_mode"]).to(beNil())
+
                 for event in events {
-                    expect(event.properties["$recording_status"] as? String) == "disabled"
-                    expect(event.properties["$sdk_debug_replay_capture_mode"] as? String) == "wireframe"
-                    expect(event.properties["$sdk_debug_replay_throttle_delay_ms"] as? Int) == 1000
-                    expect(event.properties["$sdk_debug_session_start"]).toNot(beNil())
-                    expect(event.properties["$sdk_debug_current_session_duration"]).toNot(beNil())
                     expect(event.properties["$sdk_debug_pending_queue_size"]).toNot(beNil())
                 }
 
@@ -421,10 +429,15 @@ class PostHogSDKTest: QuickSpec {
                 let result = XCTWaiter.wait(for: [server.snapshotExpectation!], timeout: testRequestTimeout)
                 expect(result) == .completed
 
-                let request = server.snapshotRequests.first
-                expect(request).toNot(beNil())
-                let body = request.flatMap { server.parseRequest($0, gzip: true) }
-                let props = body?["properties"] as? [String: Any] ?? [:]
+                let request = try XCTUnwrap(server.snapshotRequests.first)
+                let data = try XCTUnwrap(request.body()).gunzipped()
+                let events = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [[String: Any]])
+                expect(events.count) == 1
+                let event = try XCTUnwrap(events.first)
+                expect(event["event"] as? String) == "$snapshot"
+                let props = try XCTUnwrap(event["properties"] as? [String: Any])
+                expect(props["$session_id"] as? String) == "00000000-0000-7000-8000-000000000099"
+                expect(props["$snapshot_source"] as? String) == "mobile"
 
                 expect(props["$recording_status"]).to(beNil())
                 expect(props.keys.contains { $0.hasPrefix("$sdk_debug_") }).to(beFalse())
@@ -440,7 +453,7 @@ class PostHogSDKTest: QuickSpec {
                 defer { postHogSdkName = original }
 
                 let sut = self.getSut()
-                sut.capture("test event")
+                sut.screen("theScreen")
 
                 let events = getBatchedEvents(server)
                 expect(events.first?.properties["$sdk_debug_replay_capture_mode"] as? String) == "screenshot"
@@ -555,8 +568,6 @@ class PostHogSDKTest: QuickSpec {
         it("sets opt out via config") {
             let sut = self.getSut(optOut: true)
 
-            sut.optOut()
-
             expect(sut.isOptOut()) == true
 
             sut.reset()
@@ -641,6 +652,11 @@ class PostHogSDKTest: QuickSpec {
             expect(event.properties["$feature_flag_version"] as? Int) == 23
             expect(event.properties["$feature_flag_reason"] as? String) == "Matched condition set 3"
             expect(event.properties["$feature_flag_has_experiment"] as? Bool) == true
+
+            // $feature_flag_called gets the required keys but never the optional ones.
+            expect(event.properties["$recording_status"] as? String) == "disabled"
+            expect(event.properties["$sdk_debug_session_start"]).to(beNil())
+            expect(event.properties["$sdk_debug_pending_queue_size"]).toNot(beNil())
 
             sut.reset()
             sut.close()
@@ -794,7 +810,7 @@ class PostHogSDKTest: QuickSpec {
             expect(event.properties["$feature/bool-value"] as? Bool) == true
             expect(event.properties["$active_feature_flags"]).toNot(beNil())
             expect(event.properties["$is_identified"]).toNot(beNil())
-            expect(event.properties["$recording_status"]).toNot(beNil())
+            expect(event.properties["$recording_status"] as? String) == "disabled"
 
             sut.reset()
             sut.close()
@@ -1036,9 +1052,12 @@ class PostHogSDKTest: QuickSpec {
             let event = events.first!
 
             expect(event.properties["test1"]) == nil
-            expect(event.properties["test2"]) == nil
-            expect(event.properties["test3"]) == nil
-            expect(event.properties["test4"]) == nil
+            let set = try XCTUnwrap(event.properties["$set"] as? [String: Any])
+            let setOnce = try XCTUnwrap(event.properties["$set_once"] as? [String: Any])
+            expect(set["userProp"] as? String) == "value"
+            expect(setOnce["userPropOnce"] as? String) == "value"
+            expect(set["test2"]).to(beNil())
+            expect(setOnce["test3"]).to(beNil())
             expect(event.properties["test5"]) == nil
             expect(event.properties["arrayIsOk"]) != nil
             expect(event.properties["dictIsOk"]) != nil
@@ -1273,9 +1292,12 @@ class PostHogSDKTest: QuickSpec {
 
             _ = sut.getFeatureFlag("some_key")
 
+            let reloaded = XCTestExpectation(description: "second flag lookup completed")
             sut.reloadFeatureFlags {
                 _ = sut.getFeatureFlag("some_key")
+                reloaded.fulfill()
             }
+            expect(XCTWaiter.wait(for: [reloaded], timeout: testRequestTimeout)) == .completed
             sut.capture("force_batch_flush")
 
             let event = getBatchedEvents(server)
@@ -1327,7 +1349,7 @@ class PostHogSDKTest: QuickSpec {
                     beforeEach {
                         sut = self.getSut(
                             sendFeatureFlagEvent: true,
-                            flushAt: 1,
+                            flushAt: 100,
                             beforeSend: [{
                                 $0.event == eventTrigger.targetKey ? nil : $0
                             }]
@@ -1338,6 +1360,7 @@ class PostHogSDKTest: QuickSpec {
                         it("skips the event") {
                             sut.capture(testOtherEventKey)
                             eventTrigger.triggerClosure(sut)
+                            sut.flush()
 
                             let events = getBatchedEvents(server)
                             let eventNames = events.map(\.event)
@@ -1349,6 +1372,7 @@ class PostHogSDKTest: QuickSpec {
                         it("preserves other events") {
                             sut.capture(testOtherEventKey)
                             eventTrigger.triggerClosure(sut)
+                            sut.flush()
 
                             let event = getBatchedEvents(server)
 
@@ -1612,6 +1636,7 @@ class PostHogSDKTest: QuickSpec {
                     let config = PostHogConfig(projectToken: testProjectToken)
                     config.captureElementInteractions = false
                     let sut = PostHogSDK.with(config)
+                    defer { sut.close() }
 
                     expect(sut.isAutocaptureActive()).to(beFalse())
                 }

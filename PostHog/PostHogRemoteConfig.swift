@@ -60,6 +60,11 @@ class PostHogRemoteConfig {
     /// `clear()` (on `reset()`) so bootstrap never re-applies to a different user. Under `featureFlagsLock`.
     private var bootstrappedFlags: [String: Any]
     private var bootstrappedPayloads: [String: Any]
+    /// Set in `init` when bootstrap flags were seeded, consumed by `notifyBootstrappedFlagsIfSeeded()`.
+    /// Under `featureFlagsLock`. Internal for testing.
+    var bootstrapNotifyPending = false
+    /// Main thread only: set in delivery order, just before each flags-loaded notification is invoked.
+    private var latestFeatureFlagsLoadFailed = false
     // In-memory and reset each launch (matching posthog-js), so a returning user still reports
     // $used_bootstrap_value true while served bootstrap values until this session's own /flags.
     private var flagsLoadedFromRemote = false
@@ -142,11 +147,10 @@ class PostHogRemoteConfig {
         // Load cached person and group properties for flags
         loadCachedPropertiesForFlags()
 
-        // Fire the flags-loaded notification as soon as bootstrap is seeded (matches posthog-js firing
+        // Seed bootstrap now; the SDK fires the flags-loaded notification for it via
+        // notifyBootstrappedFlagsIfSeeded() once its listeners are subscribed (matches posthog-js firing
         // onFeatureFlags on bootstrap) so listeners aren't blocked on the first /flags response
-        if seedBootstrapFlagsIfNeeded() {
-            notifyFeatureFlags(getFeatureFlags())
-        }
+        bootstrapNotifyPending = seedBootstrapFlagsIfNeeded()
 
         preloadSessionReplay()
         preloadErrorTrackingConfig()
@@ -318,9 +322,8 @@ class PostHogRemoteConfig {
     }
 
     private func preloadSessionReplay() {
-        let sessionReplay = remoteConfigLock.withLock {
-            getCachedRemoteConfig()?["sessionRecording"] as? [String: Any]
-        }
+        let cachedRemoteConfig = remoteConfigLock.withLock { getCachedRemoteConfig() }
+        let sessionReplay = cachedRemoteConfig?["sessionRecording"] as? [String: Any]
         let featureFlags = featureFlagsLock.withLock {
             self.getCachedFeatureFlags()
         }
@@ -329,15 +332,21 @@ class PostHogRemoteConfig {
             if let endpoint = sessionReplay["endpoint"] as? String {
                 config.snapshotEndpoint = endpoint
             }
+            // Snapshots queued before the limit still flush to the cached endpoint.
+            guard !Self.isMobileRecordingsQuotaLimited(cachedRemoteConfig) else { return }
 
-            sessionReplayLock.withLock {
-                sessionReplayFlagActive = isRecordingActive(featureFlags ?? [:], sessionReplay)
+            let exposure = sessionReplayLock.withLock { () -> (String?, Any?) in
+                let decision = isRecordingActive(featureFlags ?? [:], sessionReplay)
+                sessionReplayFlagActive = decision.active
                 sessionReplayLinkedFlagConfigured = Self.hasLinkedFlag(sessionReplay)
                 #if os(iOS)
                     recordingSampleRate = parseSampleRate(sessionReplay["sampleRate"])
                     recordingMinimumDuration = parseMinimumDuration(sessionReplay["minimumDurationMilliseconds"])
                 #endif
+                return (decision.flagKey, decision.flagValue)
             }
+            // `$feature_flag_called` reads replay state under this same lock. Report after releasing it.
+            reportLinkedFlagExposure(flagKey: exposure.0, flagValue: exposure.1)
         }
     }
 
@@ -347,7 +356,12 @@ class PostHogRemoteConfig {
         sessionRecording["linkedFlag"] is String || sessionRecording["linkedFlag"] is [String: Any]
     }
 
-    private func isRecordingActive(_ featureFlags: [String: Any], _ sessionRecording: [String: Any]) -> Bool {
+    /// `sessionRecording` is shared with web, so the server reports the mobile replay quota only here.
+    private static func isMobileRecordingsQuotaLimited(_ remoteConfig: [String: Any]?) -> Bool {
+        (remoteConfig?["quotaLimited"] as? [String])?.contains("mobile_recordings") ?? false
+    }
+
+    private func isRecordingActive(_ featureFlags: [String: Any], _ sessionRecording: [String: Any]) -> (active: Bool, flagKey: String?, flagValue: Any?) {
         var recordingActive = true
         var flagKey: String?
         var flagValue: Any?
@@ -389,12 +403,18 @@ class PostHogRemoteConfig {
         // is also a valid check but since we cannot check the value of the flag,
         // we consider session recording is active
 
-        // Report the feature flag as called so usage is tracked
+        // The caller reports this after releasing `sessionReplayLock`. Capturing
+        // `$feature_flag_called` reads replay state under that lock, and the lock is not recursive.
         if let flagKey, let flagValue, config.sendFeatureFlagEvent {
+            return (recordingActive, flagKey, flagValue)
+        }
+        return (recordingActive, nil, nil)
+    }
+
+    private func reportLinkedFlagExposure(flagKey: String?, flagValue: Any?) {
+        if let flagKey, let flagValue {
             featureFlagCalledCallback?(flagKey, flagValue)
         }
-
-        return recordingActive
     }
 
     func loadFeatureFlags(
@@ -563,10 +583,17 @@ class PostHogRemoteConfig {
 
     #if os(iOS)
         private func processSessionRecordingConfig(_ data: [String: Any]?, featureFlags: [String: Any]) {
+            let cachedRemoteConfig = remoteConfigLock.withLock { getCachedRemoteConfig() }
             // fall back to the cached remote config (survives reset()) so replay re-arms; only Bool false disables
-            let sessionRecording: Any? = data?["sessionRecording"]
-                ?? remoteConfigLock.withLock { getCachedRemoteConfig()?["sessionRecording"] }
+            var sessionRecording: Any? = data?["sessionRecording"] ?? cachedRemoteConfig?["sessionRecording"]
+            if Self.isMobileRecordingsQuotaLimited(data ?? cachedRemoteConfig) {
+                // swiftlint:disable:next line_length
+                hedgeLog("Warning: Session replay quota limit reached - recording is disabled. See https://posthog.com/docs/billing/limits-alerts for more information.")
+                sessionRecording = false
+            }
 
+            var exposureKey: String?
+            var exposureValue: Any?
             if let sessionRecording = sessionRecording as? Bool {
                 sessionReplayLock.withLock {
                     sessionReplayFlagActive = sessionRecording
@@ -577,19 +604,26 @@ class PostHogRemoteConfig {
                 if let endpoint = sessionRecording["endpoint"] as? String {
                     config.snapshotEndpoint = endpoint
                 }
-                sessionReplayLock.withLock {
+                let exposure = sessionReplayLock.withLock {
                     applySessionRecordingConfigLocked(sessionRecording, featureFlags: featureFlags)
                 }
+                exposureKey = exposure.flagKey
+                exposureValue = exposure.flagValue
             }
+            // `$feature_flag_called` reads replay state under sessionReplayLock. Report after releasing it.
+            reportLinkedFlagExposure(flagKey: exposureKey, flagValue: exposureValue)
         }
 
         /// Applies a `sessionRecording` config dict to the in-memory replay state (active flag,
         /// sample rate, minimum duration). The caller must already hold `sessionReplayLock`.
-        private func applySessionRecordingConfigLocked(_ recordingConfig: [String: Any], featureFlags: [String: Any]) {
-            sessionReplayFlagActive = isRecordingActive(featureFlags, recordingConfig)
+        /// The linked-flag exposure is returned so the caller can report it after releasing the lock.
+        private func applySessionRecordingConfigLocked(_ recordingConfig: [String: Any], featureFlags: [String: Any]) -> (flagKey: String?, flagValue: Any?) {
+            let decision = isRecordingActive(featureFlags, recordingConfig)
+            sessionReplayFlagActive = decision.active
             sessionReplayLinkedFlagConfigured = Self.hasLinkedFlag(recordingConfig)
             recordingSampleRate = parseSampleRate(recordingConfig["sampleRate"])
             recordingMinimumDuration = parseMinimumDuration(recordingConfig["minimumDurationMilliseconds"])
+            return (decision.flagKey, decision.flagValue)
         }
 
         /// Parses and validates a sample rate value which may come as a String (from the API JSON)
@@ -749,8 +783,12 @@ class PostHogRemoteConfig {
         errorTrackingLock.withLock { autoCaptureExceptions }
     }
 
-    private func notifyFeatureFlags(_ featureFlags: [String: Any]?) {
+    /// `nil` reports a failed load. Bootstrap notifications leave the latest load outcome unchanged.
+    private func notifyFeatureFlags(_ featureFlags: [String: Any]?, isBootstrap: Bool = false) {
         DispatchQueue.main.async {
+            if !isBootstrap {
+                self.latestFeatureFlagsLoadFailed = featureFlags == nil
+            }
             self.onFeatureFlagsLoaded.invoke(featureFlags)
             NotificationCenter.default.post(name: PostHogSDK.didReceiveFeatureFlags, object: nil)
         }
@@ -811,6 +849,24 @@ class PostHogRemoteConfig {
         if let boolValue = value as? Bool { return boolValue }
         if let stringValue = value as? String { return !stringValue.isEmpty }
         return false
+    }
+
+    /// Whether the latest delivered attempt to load feature flags failed. Main thread only.
+    func didLatestFeatureFlagsLoadFail() -> Bool {
+        latestFeatureFlagsLoadFailed
+    }
+
+    /// Fires the flags-loaded notification for bootstrapped flags. Called by the SDK at the end of
+    /// `setup()`, once its own and its integrations' listeners are subscribed, so it isn't lost
+    /// when setup runs off the main thread. One-shot.
+    func notifyBootstrappedFlagsIfSeeded() {
+        let pending = featureFlagsLock.withLock { () -> Bool in
+            defer { bootstrapNotifyPending = false }
+            return bootstrapNotifyPending
+        }
+        if pending {
+            notifyFeatureFlags(getFeatureFlags(), isBootstrap: true)
+        }
     }
 
     /// Seeds `config.bootstrap` feature flags and payloads as the served snapshot before the first
@@ -1279,6 +1335,14 @@ private struct PendingFeatureFlagsRequest {
         func setSessionReplayFlagActiveForTesting(_ active: Bool) {
             sessionReplayLock.withLock {
                 sessionReplayFlagActive = active
+            }
+        }
+
+        /// Force-set the in-memory recording sample rate, so tests can sequence `applyRemoteConfig`
+        /// deliveries that sample the current session out and back in without a live /config.
+        func setRecordingSampleRateForTesting(_ sampleRate: Double?) {
+            sessionReplayLock.withLock {
+                recordingSampleRate = sampleRate
             }
         }
 
