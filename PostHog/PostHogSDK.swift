@@ -641,6 +641,10 @@ let maxRetryDelay = 30.0
     /// Internal marker on built properties, stripped in `buildEvent` and carried on the event instead.
     private static let replayDebugClaimMarkerKey = "$__replay_debug_claim"
 
+    private static func isBlank(_ value: String) -> Bool {
+        value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
     private static func isReplayDebugEvent(_ event: String?) -> Bool {
         guard let event else { return false }
         return event.hasPrefix("$")
@@ -702,7 +706,7 @@ let maxRetryDelay = 30.0
         // here, so the debug keys must describe the session this event lands in (mirrors posthog-js).
         // A caller-supplied $session_id wins so replay snapshots never land in the wrong session.
         let eventTime = timestamp ?? now()
-        let propSessionId = properties?["$session_id"] as? String
+        let propSessionId = (properties?["$session_id"] as? String).flatMap { Self.isBlank($0) ? nil : $0 }
         let sessionId: String? = propSessionId.isNilOrEmpty
             ? sessionManager.getSessionId(at: eventTime, readOnly: readOnlySession)
             : propSessionId
@@ -728,10 +732,62 @@ let maxRetryDelay = 30.0
             if groups != nil {
                 // $groups are also set via the dynamicContext
                 let currentGroups = props["$groups"] as? [String: String] ?? [:]
-                let mergedGroups = currentGroups.merging(groups ?? [:]) { current, _ in current }
+                let mergedGroups = currentGroups.merging(groups ?? [:]) { _, new in new }
                 props["$groups"] = mergedGroups
             }
 
+            // Only stamp if the caller didn't supply a non-empty value. Whitespace-only
+            // caller values are treated as absent (almost always accidental).
+            let trimmedCallerScreenName = (properties?["$screen_name"] as? String)?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if let name = lastScreenName, !name.isEmpty, trimmedCallerScreenName.isNilOrEmpty {
+                props["$screen_name"] = name
+            }
+        }
+
+        let sdkInfo = context?.sdkInfo()
+        if sdkInfo != nil {
+            props = props.merging(sdkInfo ?? [:]) { current, _ in current }
+        }
+
+        if let sessionId {
+            if propSessionId.isNilOrEmpty {
+                props["$session_id"] = sessionId
+            }
+            // only Session replay requires $window_id, so we set as the same as $session_id.
+            // the backend might fallback to $session_id if $window_id is not present next.
+            #if os(iOS)
+                if !appendSharedProps, isSessionReplayActive() {
+                    props["$window_id"] = sessionId
+                }
+            #endif
+        }
+
+        // only Session Replay needs distinct_id also in the props
+        // remove after https://github.com/PostHog/posthog/issues/23275 gets merged
+        let propDistinctId = properties?["distinct_id"] as? String
+        if !appendSharedProps, propDistinctId.map(Self.isBlank) ?? true {
+            props["distinct_id"] = distinctId
+        }
+
+        // Caller-supplied properties win over registered super properties and SDK context.
+        // A blank caller value for a key the SDK filled in above is treated as absent.
+        var callerProps = properties ?? [:]
+        for key in ["$session_id", "$screen_name", "distinct_id"] where props[key] != nil {
+            if let value = callerProps[key] as? String, !Self.isBlank(value) {
+                continue
+            }
+            callerProps.removeValue(forKey: key)
+        }
+        // A caller-supplied $groups adds to the registered and per-call groups instead of replacing them.
+        if let callerGroups = callerProps["$groups"] as? [String: String], let currentGroups = props["$groups"] as? [String: String] {
+            callerProps["$groups"] = currentGroups.merging(callerGroups) { _, new in new }
+        }
+        props.merge(callerProps) { _, new in new }
+
+        // After the caller merge so the SDK's person-processing state, geoip opt-out and debug
+        // values can't be overridden per event, matching posthog-js and posthog-android.
+        if appendSharedProps {
             if let isIdentified = config.storageManager?.isIdentified() {
                 props["$is_identified"] = isIdentified
             }
@@ -772,48 +828,7 @@ let maxRetryDelay = 30.0
             if let depth = queue?.depth {
                 props["$sdk_debug_pending_queue_size"] = depth
             }
-
-            // Only stamp if the caller didn't supply a non-empty value —
-            // `merging(properties)` below keeps the existing value on conflict,
-            // so seeding would shadow a caller-supplied override. Whitespace-only
-            // caller values are treated as absent (almost always accidental).
-            let trimmedCallerScreenName = (properties?["$screen_name"] as? String)?
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            if let name = lastScreenName, !name.isEmpty, trimmedCallerScreenName.isNilOrEmpty {
-                props["$screen_name"] = name
-            }
         }
-
-        let sdkInfo = context?.sdkInfo()
-        if sdkInfo != nil {
-            props = props.merging(sdkInfo ?? [:]) { current, _ in current }
-        }
-
-        if let sessionId {
-            if propSessionId.isNilOrEmpty {
-                props["$session_id"] = sessionId
-            }
-            // only Session replay requires $window_id, so we set as the same as $session_id.
-            // the backend might fallback to $session_id if $window_id is not present next.
-            #if os(iOS)
-                if !appendSharedProps, isSessionReplayActive() {
-                    props["$window_id"] = sessionId
-                }
-            #endif
-        }
-
-        // only Session Replay needs distinct_id also in the props
-        // remove after https://github.com/PostHog/posthog/issues/23275 gets merged
-        let propDistinctId = properties?["distinct_id"] as? String
-        if !appendSharedProps, propDistinctId == nil || propDistinctId?.isEmpty == true {
-            props["distinct_id"] = distinctId
-        }
-
-        let callerProps = properties ?? [:]
-        props = props.merging(callerProps) { current, _ in current }
-        // Caller-supplied feature-flag properties take precedence over the cached values
-        let callerFlagProps = callerProps.filter { $0.key.hasPrefix("$feature/") || $0.key == "$active_feature_flags" }
-        props = props.merging(callerFlagProps) { _, new in new }
 
         return props
     }
@@ -1685,11 +1700,12 @@ let maxRetryDelay = 30.0
     /// The title is also cached and automatically attached as `$screen_name` to
     /// every subsequent event (until `reset()` or `close()` clears it).
     ///
-    /// To override the auto-attached value on a specific event, pass `$screen_name`
+    /// To override the auto-attached value on another event, pass `$screen_name`
     /// in that event's `properties` dictionary.
     ///
     /// - Parameters:
-    ///   - screenTitle: The screen name to record.
+    ///   - screenTitle: The screen name to record. It takes precedence over a
+    ///     `$screen_name` key in `properties`.
     ///   - properties: Additional properties to attach to this `$screen` event.
     @objc(screenWithTitle:properties:)
     public func screen(_ screenTitle: String, properties: [String: Any]? = nil) {
@@ -1724,7 +1740,7 @@ let maxRetryDelay = 30.0
 
         let props = [
             "$screen_name": cleaned,
-        ].merging(sanitizeDictionary(properties) ?? [:]) { _, new in new }
+        ].merging(sanitizeDictionary(properties) ?? [:]) { current, _ in current }
 
         let distinctId = getDistinctId()
 
@@ -2020,6 +2036,7 @@ let maxRetryDelay = 30.0
     /// Associates subsequent events with a group and optionally updates group properties.
     ///
     /// This sends a `$groupidentify` event and reloads feature flags if the group value changed.
+    /// The call is ignored if `type` or `key` is empty.
     ///
     /// - Parameters:
     ///   - type: Group type, such as `"company"` or `"organization"`.
@@ -2028,6 +2045,11 @@ let maxRetryDelay = 30.0
     @objc(groupWithType:key:groupProperties:)
     public func group(type: String, key: String, groupProperties: [String: Any]? = nil) {
         if !isEnabled() {
+            return
+        }
+
+        if type.isEmpty || key.isEmpty {
+            hedgeLog("group call not allowed, type and key must not be empty")
             return
         }
 
@@ -2608,7 +2630,7 @@ let maxRetryDelay = 30.0
     }
 
     /// The strict property allowlist for minimal `$feature_flag_called` events. Everything else —
-    /// registered super properties, `$active_feature_flags`, the `$feature/<key>` enumeration,
+    /// other registered super properties, `$active_feature_flags`, the `$feature/<key>` enumeration,
     /// bootstrap enrichment — is stripped. Kept in sync with the cross-SDK minimal
     /// `$feature_flag_called` contract.
     private static let minimalFeatureFlagCalledProperties: Set<String> = [
@@ -2630,6 +2652,19 @@ let maxRetryDelay = 30.0
         "$os_name",
         "$os_version",
         "$app_version",
+        // Session attribution: web analytics reads session-initial attribution from the first event
+        // in a session, which can be a minimized $feature_flag_called. iOS doesn't register these
+        // itself, but apps can via register(). The full $referrer is intentionally excluded.
+        "$referring_domain",
+        "utm_source",
+        "utm_medium",
+        "utm_campaign",
+        "utm_content",
+        "utm_term",
+        "gad_source",
+        "mc_cid",
+        "gclid",
+        "fbclid",
         // Forward-looking cross-SDK contract entries: not produced by buildProperties for
         // $feature_flag_called on iOS today ($device_id is added later by PostHogApi on the
         // /flags request only; $window_id is snapshot-only; $feature_flag_error isn't emitted
@@ -2815,7 +2850,9 @@ let maxRetryDelay = 30.0
 
     /// Shuts down this SDK instance and clears its in-memory state.
     ///
-    /// Queues are stopped, integrations are uninstalled, and this instance must be set up again before reuse.
+    /// Starts sending queued events, session replay snapshots, and logs (up to one batch each) and returns without
+    /// waiting for delivery. Anything not sent, for example while offline, stays on disk and is sent after the next
+    /// setup. Integrations are uninstalled, and this instance must be set up again before reuse.
     @objc public func close() {
         if !isEnabled() {
             return
@@ -2824,6 +2861,10 @@ let maxRetryDelay = 30.0
         setupLock.withLock {
             enabled = false
             PostHogSDK.projectTokens.remove(config.projectToken)
+
+            queue?.flush()
+            replayQueue?.flush()
+            logsQueue?.flush()
 
             queue?.stop()
             replayQueue?.stop()
@@ -2947,6 +2988,11 @@ let maxRetryDelay = 30.0
          remote config loads, event triggers and session changes will not start recording until the app
          calls `startSessionRecording()` again.
 
+         Stopping also starts a best-effort, asynchronous flush of replay snapshots already recorded instead of
+         waiting for the next scheduled flush. Normal buffering and delivery limits still apply: snapshots can be
+         held back, for example because the session is shorter than the minimum duration, and a large backlog is
+         sent over more than one flush.
+
          This method will have no effect if PostHog is not enabled
          */
         @objc public func stopSessionRecording() {
@@ -2959,6 +3005,7 @@ let maxRetryDelay = 30.0
             }
 
             replayIntegration.stop()
+            replayQueue?.flush()
         }
 
         /// Captures the current native window for a first-party wrapper SDK
@@ -3235,12 +3282,23 @@ let maxRetryDelay = 30.0
         return steps.isEmpty ? nil : steps
     }
 
+    // $exception_level and $exception_source stay overridable: captureException has no other way to set
+    // the level, and posthog-android and posthog-js also let caller properties win for these keys
+    private static let reservedExceptionPropertyKeys: Set<String> = [
+        "$exception_list",
+        "$debug_images",
+    ]
+
     private func captureExceptionEvent(
         _ exceptionProperties: [String: Any],
         additionalProperties: [String: Any]?
     ) {
         var mergedProperties = exceptionProperties
-        additionalProperties?.forEach { mergedProperties[$0.key] = $0.value }
+        additionalProperties?.forEach { key, value in
+            // These describe the captured exception itself, so caller properties can't override them
+            guard !PostHogSDK.reservedExceptionPropertyKeys.contains(key) else { return }
+            mergedProperties[key] = value
+        }
 
         // ignoredExceptionTypes is enforced in captureInternal, the chokepoint for every $exception path
         capture("$exception", properties: mergedProperties)

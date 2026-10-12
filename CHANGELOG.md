@@ -1,5 +1,64 @@
 ## Next
 
+## 3.92.0
+
+### Minor Changes
+
+- d4ea175: Change properties passed to `capture()` and the other event methods to override registered super properties and SDK context properties such as `$app_version`, `$os_name` and `$lib`, and a group passed in `groups:` to override a group set with `group()`, matching posthog-android and posthog-js. If you relied on the registered or SDK value winning, stop passing the conflicting key per event; `$is_identified`, `$process_person_profile`, `$geoip_disable`, `$recording_status` and `$sdk_debug_*` properties are still set by the SDK.
+
+### Patch Changes
+
+- 5d2a98b: Send queued events, session replay snapshots, and logs when `close()` is called instead of holding them until the next SDK setup
+- f524e31: Keep `$referring_domain` and registered UTM/click-id super properties on minimal `$feature_flag_called` events
+- 4257154: Ignore `group(type:key:)` calls with an empty `type` or `key`. Previously they stored the empty group on later events and sent an invalid `$groupidentify`; now the call does nothing and logs a debug message
+- ea22826: Fix `errorTrackingConfig.ignoredExceptionTypes` not dropping matching `$exception` events on watchOS and visionOS
+- 4708ca1: Cap how long a `Retry-After` response header can pause log uploads at 5 minutes.
+- 8ad4249: Fix `$recording_status` reporting `active` after a backgrounded session times out, while `isSessionReplayActive()` returns `false`
+- 0aa4af5: Send already recorded session replay snapshots when `stopSessionRecording()` is called instead of holding them until the next flush
+
+## 3.91.2
+
+### Patch Changes
+
+- c61cbdc: Retry feature flag requests after DNS, TLS handshake, and no-internet failures, in addition to timeouts and lost connections
+
+## 3.91.1
+
+### Patch Changes
+
+- 95f7173: Fix `$exception` event metadata: link chained errors with `exception_id`/`parent_id`, cap the chain at 50 entries, add `$exception_source` to crash and out-of-memory reports, and stop `captureException` properties from overriding `$exception_list` and `$debug_images`
+- 7c51382: Drop log attributes with an empty key instead of sending them
+
+## 3.91.0
+
+### Minor Changes
+
+- f5cbe87: Add `$app_build_xcode` and `$app_build_sdk` properties to `Application Installed` and `Application Updated` events with the Xcode version and SDK the host app was built with
+
+## 3.90.2
+
+### Patch Changes
+
+- 9add537: Start the survey wait period when a survey shows, so a restart before close does not skip it
+
+## 3.90.1
+
+### Patch Changes
+
+- 8b793c5: `screen(_:properties:)` records the screen title as `$screen_name` again when `properties` also contains `$screen_name`, as it did before 3.59.0.
+
+## 3.90.0
+
+### Minor Changes
+
+- 2a92154: Deprecate `PostHogDataMode.cellular`. It has always behaved the same as `.any`, so use `.any` instead. It will be removed in 4.0.
+
+## 3.89.2
+
+### Patch Changes
+
+- 899b72a: Keep `$recording_status`, the replay trigger statuses and the replay buffer length on every captured event. Add the remaining `$sdk_debug_*` session replay properties and `$sdk_debug_session_start` only to SDK events (names starting with `$`, excluding `$feature_flag_called` and `$snapshot`), at most once every 30 seconds. Remove `$sdk_debug_current_session_duration` and `$sdk_debug_replay_throttle_delay_ms`.
+
 ## 3.89.1
 
 ### Patch Changes
