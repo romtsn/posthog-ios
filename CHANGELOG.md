@@ -1,5 +1,30 @@
 ## Next
 
+## 3.92.4
+
+### Patch Changes
+
+- 6c921e2: Mask a `UIImageView` in session replay when any of its `image`, `highlightedImage`, `animationImages` or `highlightedAnimationImages` is not an SF Symbol or asset-catalog image. Before, only `image` was checked, so an animating or highlighted image view could be recorded unmasked even with `maskAllImages` on.
+
+## 3.92.3
+
+### Patch Changes
+
+- 40b7495: Keep a session recording that an event trigger started when remote config updates the event triggers, such as the first `/config` fetch after launch, matching posthog-js and posthog-android
+- 0987066: Restart session replay on `optIn()` in a new session whenever the app wanted it on at `optOut()`: `sessionReplay` is enabled or the app called `startSessionRecording()`, and it didn't call `stopSessionRecording()` since. This includes a recording started with `sessionReplay` disabled and one held by an event trigger or sampling, which are checked again for the new session. Also keep integrations in step with consent when `optIn()` and `optOut()` run concurrently
+
+## 3.92.2
+
+### Patch Changes
+
+- 9091129: Stop exception autocapture from starting while the SDK is opted out, when a remote config that enables it arrives after `optOut()`. A later `optIn()` also no longer skips installing the other integrations.
+
+## 3.92.1
+
+### Patch Changes
+
+- 12de246: Start session replay in a new session when `optIn()` is called, and keep it stopped if the app had called `stopSessionRecording()` before `optOut()`
+
 ## 3.92.0
 
 ### Minor Changes

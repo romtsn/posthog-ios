@@ -264,10 +264,11 @@
 
         /// `config.sessionReplay` controls automatic starts; a recording explicitly started while it was
         /// off is allowed to resume (e.g. into a new session) until an explicit stop. Caller holds
-        /// `bufferingLock`.
-        private func isAutomaticStartPermittedLocked() -> Bool {
-            guard let config else { return false }
-            return config.sessionReplay || startedWithAutomaticDisabled
+        /// `bufferingLock` and passes `config?.sessionReplay` read before taking it: the `config` getter
+        /// takes the SDK's setupLock, whose holders (optOut(), stopSessionRecording()) take `bufferingLock`.
+        private func isAutomaticStartPermittedLocked(sessionReplay: Bool?) -> Bool {
+            guard let sessionReplay else { return false }
+            return sessionReplay || startedWithAutomaticDisabled
         }
 
         /// Flips `isEnabled` and resets the buffering state in one lock acquisition, re-checking the
@@ -275,8 +276,9 @@
         /// early gate in `startRecording()` and this claim clears the marker first, so it wins for `isEnabled`.
         private func claimRecording() -> Bool {
             let awaiting = shouldAwaitFirstRemoteConfig()
+            let sessionReplay = config?.sessionReplay
             let claimed = bufferingLock.withLock { () -> Bool in
-                guard !isEnabled, isAutomaticStartPermittedLocked() else { return false }
+                guard !isEnabled, isAutomaticStartPermittedLocked(sessionReplay: sessionReplay) else { return false }
                 isEnabled = true
                 hasPassedMinimumDuration = false
                 awaitingFirstRemoteConfig = awaiting
@@ -291,7 +293,8 @@
         private func startRecording() {
             guard let postHog, !isEnabled else { return }
 
-            guard bufferingLock.withLock({ isAutomaticStartPermittedLocked() }) else {
+            let sessionReplay = config?.sessionReplay
+            guard bufferingLock.withLock({ isAutomaticStartPermittedLocked(sessionReplay: sessionReplay) }) else {
                 hedgeLog("[Session Replay] Automatic replay is disabled in config and no manual start is pending. Skipping start.")
                 return
             }
@@ -977,6 +980,8 @@
             if let image = view as? UIImageView {
                 if isImageViewSensitive(image) {
                     maskableWidgets.append(.init(view, in: window))
+                    // subviews can draw outside the image view's bounds, so its mask may not cover them
+                    findMaskableWidgets(inSubviewsOf: view, window, &maskableWidgets, maskChildren)
                     return
                 }
             }
@@ -1074,6 +1079,9 @@
                 }
             }
 
+            /// SwiftUI: `.drawingGroup()` and `Canvas` content (up to iOS 18)
+            if maskFlattenedContent(view, drawnBy: view, window, &maskableWidgets) { return }
+
             // SwiftUI iOS 26 (new SwiftUI rendering engine in Xcode 26)
             //
             // Note: prior to iOS 26, primitive views like Text, Image, Button were drawn
@@ -1110,14 +1118,16 @@
                 }
             }
 
-            if !view.subviews.isEmpty {
-                for child in view.subviews {
-                    if !child.isVisibleForMasking() {
-                        continue
-                    }
+            findMaskableWidgets(inSubviewsOf: view, window, &maskableWidgets, maskDescendants)
+        }
 
-                    findMaskableWidgets(child, window, &maskableWidgets, maskDescendants)
+        private func findMaskableWidgets(inSubviewsOf view: UIView, _ window: UIWindow, _ maskableWidgets: inout [MaskedRegion], _ maskChildren: Bool) {
+            for child in view.subviews {
+                if !child.isVisibleForMasking() {
+                    continue
                 }
+
+                findMaskableWidgets(child, window, &maskableWidgets, maskChildren)
             }
         }
 
@@ -1155,6 +1165,9 @@
                         maskableWidgets.append(.init(sublayer, in: window))
                     }
                 }
+
+                // `.drawingGroup()` and `Canvas` layers
+                maskFlattenedContent(sublayer, drawnBy: view, window, &maskableWidgets)
 
                 // Recursively check sublayers
                 if let sublayers = sublayer.sublayers, !sublayers.isEmpty {
@@ -1408,25 +1421,23 @@
         }
 
         private func isImageViewSensitive(_ view: UIImageView) -> Bool {
-            // if there's no image, there's nothing to mask
-            guard let image = view.image else { return false }
+            // UIKit can draw any of these depending on highlight and animation state, and an
+            // animating view may have no `image`. Masking fails closed if any of them is private.
+            let sources = [view.image, view.highlightedImage].compactMap { $0 }
+                + (view.animationImages ?? []) + (view.highlightedAnimationImages ?? [])
+
+            if sources.isEmpty {
+                return false
+            }
 
             // sensitive, regardless
             if view.isNoCapture() {
                 return true
             }
 
-            // asset images are probably not sensitive
-            if isAssetsImage(image) {
-                return false
-            }
-
-            // symbols are probably not sensitive
-            if image.isSymbolImage {
-                return false
-            }
-
+            // asset images and symbols are probably not sensitive
             return config?.sessionReplayConfig.maskAllImages == true
+                && sources.contains { !$0.isSymbolImage && !isAssetsImage($0) }
         }
 
         private func toWireframe(_ view: UIView) -> RRWireframe? {
@@ -1773,26 +1784,22 @@
                 return triggers
             }()
 
+            // Activation is per session and survives config updates (as in posthog-js and posthog-android),
+            // so a session a trigger already activated keeps recording whatever the new trigger list is.
             let previousTriggers = eventTriggersLock.withLock {
                 let prev = eventTriggers
                 eventTriggers = remoteEventTriggers
-                // Clear activated session when triggers change
-                triggerActivatedSessionId = nil
                 return prev
             }
 
-            // If triggers were added/changed and integration is running, stop it
-            if let newTriggers = remoteEventTriggers, !newTriggers.isEmpty {
+            if shouldWaitForEventTriggers() {
                 if isEnabled {
                     hedgeLog("[Session Replay] Event triggers updated. Stopping until trigger is matched.")
                     stopRecording()
                 }
-            } else if previousTriggers != nil, !previousTriggers!.isEmpty, remoteEventTriggers?.isEmpty != false {
-                // Triggers were removed - start if not already running and sampling allows
-                if !isEnabled {
-                    hedgeLog("[Session Replay] Event triggers removed. Starting replay.")
-                    startRecording()
-                }
+            } else if previousTriggers?.isEmpty == false, remoteEventTriggers?.isEmpty != false, !isEnabled {
+                hedgeLog("[Session Replay] Event triggers removed. Starting replay.")
+                startRecording()
             }
         }
     }
@@ -2029,6 +2036,40 @@
             }
 
             findMaskableWidgets(cover, window, &maskableWidgets, maskChildren)
+        }
+    }
+
+    // MARK: - Flattened SwiftUI content
+
+    private extension PostHogReplayIntegration {
+        /// `.drawingGroup()` and `Canvas` flatten their content (text, images, shapes) into one RenderBox surface
+        static let swiftUIFlattenedContentTypes = [
+            "_TtC7SwiftUIP33_863CCF9D49B535DAEB1C7D61BEE53B5914RBDrawingLayer", // iOS 26+
+            "SwiftUI.RBDrawingView", // up to iOS 18
+        ].compactMap(NSClassFromString)
+
+        /// Masks `content`, a view or a layer drawn by `view`, when it is a `.drawingGroup()` or `Canvas`
+        /// surface. Returns whether a mask was added.
+        @discardableResult
+        func maskFlattenedContent(_ content: NSObject, drawnBy view: UIView, _ window: UIWindow,
+                                  _ maskableWidgets: inout [MaskedRegion]) -> Bool
+        {
+            guard Self.swiftUIFlattenedContentTypes.contains(where: content.isKind(of:)) else {
+                return false
+            }
+
+            // The flattened surface can't be inspected and may hold text, images or both,
+            // so like a web view, mask the whole of it when either category is masked
+            guard isAnyInputSensitive(view) else {
+                return false
+            }
+
+            if let layer = content as? CALayer {
+                maskableWidgets.append(.init(layer, in: window))
+            } else if let contentView = content as? UIView {
+                maskableWidgets.append(.init(contentView, in: window))
+            }
+            return true
         }
     }
 
