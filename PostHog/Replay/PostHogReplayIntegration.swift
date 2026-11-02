@@ -948,8 +948,11 @@
             }
 
             if let textView = view as? UITextView { // TextEditor, SwiftUI.TextEditorTextView, SwiftUI.UIKitTextView
-                if isTextViewSensitive(textView) {
+                // textStorage rather than attributedText, which copies the whole text
+                if isTextViewSensitive(textView) || hasSensitiveImageAttachment(textView.textStorage) {
                     maskableWidgets.append(.init(view, in: window))
+                    // an unclipped subview can draw outside the text view's mask
+                    findMaskableWidgets(inSubviewsOf: view, window, &maskableWidgets, maskChildren || view.isNoCapture())
                     return
                 }
             }
@@ -1012,8 +1015,10 @@
             }
 
             if let label = view as? UILabel { // Text, this code might never be reachable in SwiftUI, see swiftUIImageTypes instead
-                if isLabelSensitive(label) {
+                if isLabelSensitive(label) || hasSensitiveImageAttachment(label.attributedText) {
                     maskableWidgets.append(.init(view, in: window))
+                    // an unclipped subview can draw outside the label's mask
+                    findMaskableWidgets(inSubviewsOf: view, window, &maskableWidgets, maskChildren || view.isNoCapture())
                     return
                 }
             }
@@ -1031,6 +1036,8 @@
             if let button = view as? UIButton {
                 if isButtonSensitive(button) {
                     maskableWidgets.append(.init(view, in: window))
+                    // title and image insets can lay the button's subviews out past its bounds
+                    findMaskableWidgets(inSubviewsOf: view, window, &maskableWidgets, maskChildren || view.isNoCapture())
                     return
                 }
             }
@@ -1103,19 +1110,11 @@
                 }
             }
 
-            // on RN, lots get converted to RCTRootContentView, RCTRootView, RCTView and sometimes its just the whole screen, we dont want to mask
-            // in such cases
-            var maskDescendants = maskChildren
-            if view.isNoCapture() || maskChildren {
-                let viewRect = view.toAbsoluteRect(window)
-                let windowRect = window.frame
-
-                // Check if the rectangles do not match
-                if !viewRect.equalTo(windowRect) {
-                    maskableWidgets.append(.init(view, in: window))
-                } else {
-                    maskDescendants = true
-                }
+            // Masked whole, even when it fills the window, and so is every descendant: an
+            // unclipped descendant can draw outside the view's rect.
+            let maskDescendants = view.isNoCapture() || maskChildren
+            if maskDescendants {
+                maskableWidgets.append(.init(view, in: window))
             }
 
             findMaskableWidgets(inSubviewsOf: view, window, &maskableWidgets, maskDescendants)
@@ -1193,6 +1192,7 @@
 
             let wireframe = createBasicWireframe(window)
             wireframe.maskableWidgets = maskableWidgets
+            wireframe.screenshotPixelScale = config?.sessionReplayConfig.screenshotPixelScale(nativeScale: window.screen.scale) ?? 1
             wireframe.type = "screenshot"
             return wireframe
         }
@@ -1222,6 +1222,10 @@
 
             var maskableWidgets: [MaskedRegion] = []
             findMaskableWidgets(under: cover, in: window, &maskableWidgets)
+            // A reporter inside a `ph-no-capture` view is also reached by the walk. Keep one
+            // entry per reporter: a repeated owner reads as motion to the settle check.
+            let reporters = Set(masked.regions.map(\.owner))
+            maskableWidgets.removeAll { reporters.contains($0.owner) }
             maskableWidgets.append(contentsOf: masked.regions)
             return maskableWidgets
         }
@@ -1804,6 +1808,29 @@
         }
     }
 
+    private extension PostHogReplayIntegration {
+        /// Image attachments in text are drawn by the label or text view itself, with no image view to
+        /// mask, so masking images masks text that holds one. Like image views, symbols and
+        /// asset-catalog images stay visible; an attachment whose image can't be read is masked.
+        func hasSensitiveImageAttachment(_ text: NSAttributedString?) -> Bool {
+            guard config?.sessionReplayConfig.maskAllImages == true, let text, text.length > 0 else {
+                return false
+            }
+            var found = false
+            text.enumerateAttribute(.attachment, in: NSRange(location: 0, length: text.length)) { value, _, stop in
+                guard let attachment = value as? NSTextAttachment else {
+                    return
+                }
+                if let image = attachment.image, image.isSymbolImage || isAssetsImage(image) {
+                    return
+                }
+                found = true
+                stop.pointee = true
+            }
+            return found
+        }
+    }
+
     // MARK: - Plugins
 
     extension PostHogReplayIntegration {
@@ -2026,13 +2053,9 @@
                 guard ancestor.isNoCapture() || maskChildren else {
                     continue
                 }
-                if ancestor.toAbsoluteRect(window).equalTo(window.frame) {
-                    maskChildren = true
-                } else {
-                    // An ancestor that is not the window's size is redacted as one rect, and the
-                    // cover it holds is redacted with it.
-                    maskableWidgets.append(.init(ancestor, in: window))
-                }
+                // Redacted as one rect, and the cover it holds is masked with its descendants.
+                maskableWidgets.append(.init(ancestor, in: window))
+                maskChildren = true
             }
 
             findMaskableWidgets(cover, window, &maskableWidgets, maskChildren)
