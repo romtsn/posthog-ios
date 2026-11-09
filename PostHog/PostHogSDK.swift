@@ -995,7 +995,8 @@ let maxRetryDelay = 30.0
     ///
     /// By default, the first successful identify call links prior anonymous events to the provided ID.
     /// If `PostHogConfig.reuseAnonymousId` is `true`, prior anonymous events are not linked.
-    /// Empty IDs, opted-out users, and configurations with `personProfiles == .never` are ignored.
+    /// Empty IDs and configurations with `personProfiles == .never` are ignored.
+    /// While opted out, the distinct ID and feature flags still update, but no event is captured.
     ///
     /// - Parameter distinctId: Stable user identifier from your application.
     @objc public func identify(_ distinctId: String) {
@@ -1031,10 +1032,6 @@ let maxRetryDelay = 30.0
 
         if distinctId.isEmpty {
             hedgeLog("identify call not allowed, distinctId is invalid: \(distinctId)")
-            return
-        }
-
-        if isOptOutState() {
             return
         }
 
@@ -1075,29 +1072,32 @@ let maxRetryDelay = 30.0
         }
 
         if hasDifferentDistinctId, !isIdentified {
-            var props: [String: Any] = ["distinct_id": distinctId]
+            // Opt-out gates capture only: identity and flags still follow the new distinct id.
+            if !isOptOutState() {
+                var props: [String: Any] = ["distinct_id": distinctId]
 
-            if !config.reuseAnonymousId {
-                props["$anon_distinct_id"] = oldDistinctId
-            }
+                if !config.reuseAnonymousId {
+                    props["$anon_distinct_id"] = oldDistinctId
+                }
 
-            let eventName = PostHogKnownUnsafeEditableEvent.identify.rawValue
-            let properties = buildProperties(
-                event: eventName,
-                distinctId: distinctId,
-                properties: props,
-                userProperties: sanitizeDictionary(userProperties),
-                userPropertiesSetOnce: sanitizeDictionary(userPropertiesSetOnce)
-            )
+                let eventName = PostHogKnownUnsafeEditableEvent.identify.rawValue
+                let properties = buildProperties(
+                    event: eventName,
+                    distinctId: distinctId,
+                    properties: props,
+                    userProperties: sanitizeDictionary(userProperties),
+                    userPropertiesSetOnce: sanitizeDictionary(userPropertiesSetOnce)
+                )
 
-            guard let event = buildEvent(event: eventName, distinctId: distinctId, properties: properties) else {
-                return
+                guard let event = buildEvent(event: eventName, distinctId: distinctId, properties: properties) else {
+                    return
+                }
+
+                queueEvent(event, queue: queue)
             }
 
             // Automatically set person properties for feature flags during identify() call
             setPersonPropertiesForFlagsIfNeeded(userProperties, userPropertiesSetOnce: userPropertiesSetOnce)
-
-            queueEvent(event, queue: queue)
 
             remoteConfig?.reloadFeatureFlags()
 
@@ -1661,6 +1661,7 @@ let maxRetryDelay = 30.0
             finalProperties[PostHogExceptionStepFields.stepsKey] = steps
         }
 
+        let distinctIdBeforeHooks = getDistinctId()
         // Sanitize is now called in buildEvent
         let posthogEvent = buildEvent(
             event: event,
@@ -1682,8 +1683,9 @@ let maxRetryDelay = 30.0
             return
         }
 
-        // Automatically set person properties for feature flags during capture event
-        if !skipBuildProperties {
+        // Automatically set person properties for feature flags during capture event, unless a
+        // `beforeSend` hook called `reset()` or `identify()`: they belong to the earlier user.
+        if !skipBuildProperties, getDistinctId() == distinctIdBeforeHooks {
             setPersonPropertiesForFlagsIfNeeded(userProperties, userPropertiesSetOnce: userPropertiesSetOnce)
         }
 
@@ -3829,6 +3831,10 @@ let maxRetryDelay = 30.0
 
         #if os(iOS)
             func getReplayIntegration() -> PostHogReplayIntegration? {
+                getIntegration()
+            }
+
+            func getSurveysIntegration() -> PostHogSurveyIntegration? {
                 getIntegration()
             }
         #endif

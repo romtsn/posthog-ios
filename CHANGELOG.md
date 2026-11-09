@@ -1,5 +1,37 @@
 ## Next
 
+## 3.94.0
+
+### Minor Changes
+
+- d927501: Session replay and surveys no longer swizzle `UIView.layoutSublayers(of:)`. Capture is now scheduled from an observer on the main run loop, and session replay skips rendering while the screen keeps producing identical frames. Wireframe mode now skips unchanged frames too, so idle screens send fewer `$snapshot` events. Surveys no longer require swizzling, so apps that set `enableSwizzling` to `false` now get surveys instead of having the integration skipped.
+
+## 3.93.6
+
+### Patch Changes
+
+- 9551567: Fix session replay recording touches inside views masked with `ph-no-capture` or `postHogMask()`. These touches are now dropped. Touches on views masked only by `maskAllTextInputs` or `maskAllImages` are still recorded.
+
+## 3.93.5
+
+### Patch Changes
+
+- d10bb5f: Stop emitting `$feature_flag_called` for survey flags whose keys start with `survey-targeting-`, matching the browser SDK while preserving usage tracking for ordinary linked flags.
+
+## 3.93.4
+
+### Patch Changes
+
+- 0ccda7e: A `beforeSend` hook that calls `reset()` or `identify()` no longer gives the event's `userProperties` to the next user's feature flag evaluation.
+
+## 3.93.3
+
+### Patch Changes
+
+- 23cf425: Skip a session replay screenshot when `drawHierarchy` reports it could not render the window, instead of uploading a blank frame.
+- 23cf425: Clear the session replay screenshot bitmap before drawing, so a failed or partial render can no longer upload leftover memory in a snapshot.
+- 6af1bbd: Update the user's identity and reload feature flags when `identify()` is called while opted out, matching the other PostHog SDKs. No events are captured while opted out.
+
 ## 3.93.2
 
 ### Patch Changes
