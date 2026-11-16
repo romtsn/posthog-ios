@@ -1,5 +1,76 @@
 ## Next
 
+## 3.97.2
+
+### Patch Changes
+
+- aad5e7a: Fix missing cold `Application Opened` event when `setup()` runs before UIKit creates the shared app, for example in a SwiftUI `App.init`.
+- 595f987: Fix a crash when the iPad print panel appears with screen views, autocapture, rage clicks or session replay on. The print panel claims to be a `UISplitViewController` but does not implement its API, so screen lookup now only reads real split views as one
+
+## 3.97.1
+
+### Patch Changes
+
+- 7dd82ef: Keep tracking foreground and background transitions after `reset()`. Previously `reset()` unsubscribed the session manager from app lifecycle and UI events, so sessions stopped clearing in the background, or were never created again after a reset in the background, until the app restarted.
+- 97ea8d3: Keep a masked label whose text was just cleared, and a masked image view whose image was just cleared or replaced, masked in session replay until the screen updates
+- 97ea8d3: Fix a crash in screenshot session replay when the app uses a Swift `CALayer` subclass that doesn't implement `init(layer:)`. While the app shows a custom `CALayer` subclass, replay may skip frames during fast scrolling, and masks the whole screen while a masked view's custom-layer ancestor animates.
+- 78e6184: Fix `Application Opened` sometimes missing `$session_id` after the app spent more than 30 minutes in the background: lifecycle subscribers now run in subscription order, so the session manager starts the new session before the event is captured.
+
+## 3.97.0
+
+### Minor Changes
+
+- 13bd1ae: Add the experimental `screenshotModeGPUCapture` session replay option, which renders screenshots on the GPU to cut the main-thread cost of each capture.
+
+## 3.96.2
+
+### Patch Changes
+
+- d401bd7: With `screenshotModeBackgroundCapture` on, session replay masks drifting content over the position its pixels can trail to, and skips frames captured while the screen scrolls or animates, or while a masked cell is recycled, instead of uploading them with misaligned masks.
+
+## 3.96.1
+
+### Patch Changes
+
+- b692550: Treat failed detailed feature flag records as unavailable instead of serving their placeholder values or payloads, including previously persisted placeholders. Preserve successful cached results on response-wide errors and retain failed-read evaluation diagnostics across restarts.
+
+## 3.96.0
+
+### Minor Changes
+
+- 86bb436: Support survey cancel events to clear unconsumed activation and cancel the built-in popup delay before display. Already-visible surveys and presentations owned by custom survey delegates remain active.
+
+## 3.95.0
+
+### Minor Changes
+
+- 8cfbaef: Honor survey appearance.position instead of always presenting a bottom sheet, and expose the configured position to custom survey renderers.
+
+## 3.94.4
+
+### Patch Changes
+
+- 32f78c6: Draw session replay screenshots in the screen's own color space, so a capture on a wide-gamut screen no longer converts every pixel on the main thread. The conversion now happens off the main thread on the replay queue: a resized or masked screenshot is redrawn in device RGB, and an image that reaches the WebP encoder in a wide gamut, such as a native-resolution screenshot with nothing to mask, is converted to sRGB. The WebP encoder is shared, so wide-gamut images in wireframe mode and from `imageToBase64` are converted to sRGB too, and upload in their true colors instead of having their Display P3 values read as sRGB. The JPEG fallback does not convert.
+
+## 3.94.3
+
+### Patch Changes
+
+- 6d7e886: A `/flags` load still in flight when `reset()` runs no longer writes the previous user's flags into the cache, calls `onFeatureFlags` listeners, posts `didReceiveFeatureFlags`, or is replayed to a listener registered later. The reload `reset()` starts still runs, and a `reloadFeatureFlags` callback waiting on the dropped load is called when that reload finishes.
+
+## 3.94.2
+
+### Patch Changes
+
+- 2856428: Fix surveys so `seenSurveyWaitPeriodInDays` counts from when a survey was shown rather than when it was closed, and a survey closed before it appears (for example during `surveyPopupDelaySeconds` or after `reset()`) is no longer marked seen or reported as `survey dismissed`.
+
+## 3.94.1
+
+### Patch Changes
+
+- 9e17a63: A crash report written by the native crash reporter after `optOut()` is no longer sent as `$exception` after the next `optIn()`. The native crash handler cannot be removed once installed, so at opt-out the SDK replaces the crash context with an opted-out marker and drops a pending report that carries it. A crash recorded while opted in is still delivered after `optIn()`. Reports written by SDK versions before this change carry no marker and are still sent. Out-of-memory terminations reported through MetricKit on iOS 27 are not covered by this change.
+- 9e17a63: On iOS 27+, an out-of-memory termination recorded after `optOut()` is no longer sent as `$exception` after the next `optIn()`. One from a session that was opted in is still delivered, and one with no saved context carries no consent signal and is still sent.
+
 ## 3.94.0
 
 ### Minor Changes

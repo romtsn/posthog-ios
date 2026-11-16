@@ -13,6 +13,9 @@ permissions:
 jobs:
   notify-failed:
     name: Notify Slack - Failed
+    if: >-
+      github.event.workflow_run.head_repository.full_name == github.repository &&
+      (github.event.workflow_run.event == 'push' || github.event.workflow_run.event == 'workflow_dispatch')
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -47,7 +50,7 @@ jobs:
 
       - name: Notify Slack - Failed
         if: steps.release-status.outputs.payload != ''
-        uses: slackapi/slack-github-action@af78098f536edbc4de71162a307590698245be95 # v3.0.1
+        uses: slackapi/slack-github-action@dcb1066f776dd043e64d0e8ba94ca15cc7e1875d # v4.0.0
         with:
           method: chat.postMessage
           token: ${{ secrets.SLACK_CLIENT_LIBRARIES_BOT_TOKEN }}

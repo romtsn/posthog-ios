@@ -1,4 +1,4 @@
-.PHONY: testSurveyUI build buildSdk buildExamples format swiftLint swiftFormat swiftLintCheck swiftFormatCheck installSwiftLint installSwiftFormat test testUploadSymbols recordEventShapeSnapshots testDowngradeCompatibility checkTestRegistration testOniOSSimulator testOnMacSimulator maskSnapshots recordMaskSnapshots checkMaskSnapshotRuntime lint bootstrap releaseCocoaPods api apiCheck apiUpdate buildIOS
+.PHONY: testSurveyUI build buildSdk buildExamples format swiftLint swiftFormat swiftLintCheck swiftFormatCheck installSwiftLint installSwiftFormat test testUploadSymbols recordEventShapeSnapshots testDowngradeCompatibility checkTestRegistration testOniOSSimulator testOnMacSimulator maskSnapshots recordMaskSnapshots gpuMaskSnapshots recordGPUMaskSnapshots checkMaskSnapshotRuntime lint bootstrap releaseCocoaPods api apiCheck apiUpdate buildIOS
 
 build: buildSdk buildExamples
 
@@ -188,6 +188,22 @@ recordMaskSnapshots: checkMaskSnapshotRuntime
 	  SWIFT_ACTIVE_COMPILATION_CONDITIONS='$$(inherited) TEST_MASK_SNAPSHOTS RECORD_MASK_SNAPSHOTS' \
 	  "-only-testing:PostHogTests/PostHogMaskSnapshotTest/recordGoldens()" | xcpretty
 
+# The same scenarios, plus GPU-only ones, through the GPU capture path (__GPUMaskSnapshots__/).
+gpuMaskSnapshots: checkMaskSnapshotRuntime
+	set -o pipefail && xcrun xcodebuild test -scheme PostHog \
+	  -destination "platform=iOS Simulator,id=$(MASK_SNAPSHOT_UDID)" \
+	  SWIFT_ACTIVE_COMPILATION_CONDITIONS='$$(inherited) TEST_MASK_SNAPSHOTS' \
+	  "-only-testing:PostHogTests/PostHogMaskSnapshotTest/verifyGPUGoldens()" 2>&1 | tee gpu-mask-snapshots.log | xcpretty
+	@grep -qE 'Test "[^"]+" passed' gpu-mask-snapshots.log || { \
+	  echo "error: no GPU masking snapshot test executed (0-test run); the TEST_MASK_SNAPSHOTS gate or -only-testing selector likely broke."; \
+	  exit 1; }
+
+recordGPUMaskSnapshots: checkMaskSnapshotRuntime
+	set -o pipefail && xcrun xcodebuild test -scheme PostHog \
+	  -destination "platform=iOS Simulator,id=$(MASK_SNAPSHOT_UDID)" \
+	  SWIFT_ACTIVE_COMPILATION_CONDITIONS='$$(inherited) TEST_MASK_SNAPSHOTS RECORD_MASK_SNAPSHOTS' \
+	  "-only-testing:PostHogTests/PostHogMaskSnapshotTest/recordGPUGoldens()" | xcpretty
+
 # Usage: make test filter=<pattern>
 # Examples:
 #   make test                              						# Run all tests
@@ -242,7 +258,6 @@ releaseCocoaPods: prepareCocoaPods
 	$(MAKE) publishCocoaPods
 
 prepareCocoaPods:
-	set -o pipefail && xcrun xcodebuild -downloadAllPlatforms 
 	@if ! xcrun simctl list devices | grep -q "Apple Vision Pro"; then \
 		LATEST_RUNTIME=$$(xcrun simctl list runtimes | grep "com.apple.CoreSimulator.SimRuntime.xrOS" | sort -r | head -n 1 | awk '{print $$NF}') && \
 		xcrun simctl create "Apple Vision Pro" "Apple Vision Pro" "$$LATEST_RUNTIME"; \
